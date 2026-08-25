@@ -7,7 +7,7 @@
 把收藏的專輯排成可以滑過去的 3D 封面流,配上逐句同步歌詞與 KTV 提詞。<br>
 音樂還是由 Spotify 播 —— VitroDeck 只負責讓它好看。
 
-[**下載最新版**](../../releases/latest) · [使用說明](https://shdfwww.github.io/VitroDeck/) · [回報問題](../../issues)
+[**下載最新版**](../../releases/latest) · [使用說明](https://vitrodeck.shdf.work/) · [回報問題](../../issues)
 
 ![封面流](site/img/coverflow.jpg)
 
