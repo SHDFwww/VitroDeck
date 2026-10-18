@@ -1,0 +1,37 @@
+[package]
+name = "vitro"
+version = "2.0.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+bytemuck = "1.25.2"
+ferrous-opencc = "0.4.0"
+flate2 = "1.1.10"
+glyphon = "0.12.0"
+# glyphon 底下那份。只為了開排版快取：韓文、日文每次排版都要重找 fallback 字型，沒快取時一句比中文慢十倍
+cosmic-text = { version = "0.19", features = ["shape-run-cache"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+md-5 = "0.11.0"
+naga = "30.0.1"
+pollster = "1.0.1"
+rand = "0.10.3"
+realfft = "3.5.0"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", features = ["blocking", "form", "json", "query"] }
+resvg = { version = "0.48.1", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tiny_http = "0.12.0"
+unicode-normalization = "0.1.25"
+url = "2.5.8"
+urlencoding = "2.1.3"
+wasapi = "0.24.0"
+wgpu = { version = "30.0.1", features = ["glsl"] }
+windows = { version = "0.62.2", features = ["Media_Control", "Media", "Foundation", "Storage_Streams", "Win32_System_Com", "Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry"] }
+winit = "0.30.13"
+
+[build-dependencies]
+winresource = "0.1.31"

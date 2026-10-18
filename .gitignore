@@ -1,0 +1,25 @@
+# 建置輸出
+/target/
+
+# 發行目錄（含 tokens.json，絕不能公開）
+/dist/
+
+# 使用者設定與 Spotify 權杖（任何位置）
+config.json
+tokens.json
+cache/
+
+# 驗證截圖資料夾
+/before*/
+/after*/
+/recheck/
+/help_ref/
+/light*/
+/shots/
+
+# 只留在本機的開發文件
+/筆記.md
+/配額檢測與改進報告.md
+/design_tokens.md
+/glass_ref.html
+/RELEASE_NOTES_*.md
