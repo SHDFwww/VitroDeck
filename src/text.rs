@@ -528,6 +528,38 @@ impl Text {
         out
     }
 
+    /// 文字 PV 用：一行字（不斷行）照 `size` 排版，回傳畫出來的那串字（簡轉繁過）與每個字形的
+    /// (在那串字裡的位元組起點, 寬, 字形鍵)。不乘字級倍率，大小由 PV 自己決定。
+    /// 字形鍵用原點算，同一個字不管排在哪個次像素位置都是同一把鍵（SDF 圖集只存一份）
+    pub fn glyph_run(&mut self, s: &str, size: f32, weight: u16) -> (String, Vec<(usize, f32, cosmic_text::CacheKey)>) {
+        let k = std::mem::replace(&mut self.k, 1.0);
+        let buffer = self.shape(s, size, size * 1.2, None, weight, None);
+        self.k = k;
+        let shown = self.traditional(s).unwrap_or_else(|| s.to_string());
+        let mut out = Vec::new();
+        for run in buffer.layout_runs() {
+            for g in run.glyphs {
+                out.push((g.start, g.w, g.physical((-g.x, -g.y), 1.0).cache_key));
+            }
+        }
+        (shown, out)
+    }
+
+    /// 文字 PV 用：一個字形點陣化成覆蓋率遮罩（彩色字形取 alpha）
+    pub fn raster(&mut self, key: cosmic_text::CacheKey) -> Option<crate::pv::sdf::Mask> {
+        use cosmic_text::SwashContent;
+        let img = self.swash.get_image_uncached(&mut self.font_system, key)?;
+        let (w, h) = (img.placement.width as usize, img.placement.height as usize);
+        let data = match img.content {
+            SwashContent::Mask => img.data,
+            SwashContent::Color => img.data.as_chunks::<4>().0.iter().map(|p| p[3]).collect(),
+            SwashContent::SubpixelMask => {
+                img.data.as_chunks::<4>().0.iter().map(|p| ((p[0] as u16 + p[1] as u16 + p[2] as u16) / 3) as u8).collect()
+            }
+        };
+        Some(crate::pv::sdf::Mask { data, w, h, left: img.placement.left, top: img.placement.top })
+    }
+
     /// 截成一行。太長就砍掉尾巴補上刪節號。
     ///
     /// cosmic-text 只會換行不會截斷，所以「限寬」在單行的地方沒有用 ——

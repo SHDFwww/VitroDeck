@@ -95,6 +95,17 @@ pub fn pick<'a>(cands: &'a [Candidate], artist: &str, title: &str, duration_ms: 
         .min_by_key(|c| delta(c))
 }
 
+/// 來源自己挑好、只回一首的（LyricsPlus），像不像同一首歌。
+/// 長度不明就只認曲名與歌手。比 `pick` 多收一種：歌手對得上、長度差在 1.5 秒內，
+/// 曲名寫法不同也收 —— 日文歌在 Spotify 常是英文或羅馬拼音曲名，來源那邊是原文。
+/// QQ 音樂的長度捨去到整秒，同一首也會差到將近 1 秒，所以不能再緊
+pub fn plausible(c: &Candidate, artist: &str, title: &str, duration_ms: i64) -> bool {
+    let known = c.duration_ms > 0 && duration_ms > 0;
+    if pick(std::slice::from_ref(c), artist, title, if known { duration_ms } else { 0 }).is_some() {
+        return true;
+    }
+    known && (c.duration_ms - duration_ms).abs() <= STRICT_DELTA_MS && artist_matches(artist, &c.artist)
+}
 
 #[cfg(test)]
 mod tests {
@@ -135,6 +146,22 @@ mod tests {
         let cands = [c(9, "七里香", "周杰伦", 299_000)];
         assert_eq!(pid(&cands, "Jay Chou", "七里香", 299_800), Some(9));
         assert_eq!(pid(&cands, "Jay Chou", "七里香", 302_000), None);
+    }
+
+    #[test]
+    fn same_artist_other_song_is_rejected() {
+        // LyricsPlus 照曲名搜〈小老婆〉，回的是同歌手的〈卷菸〉；公館青少年好幾首都回〈要不要跟我出去走一走〉
+        let got = c(1, "卷菸", "美秀集团", 232_000);
+        assert!(!plausible(&got, "美秀集團", "小老婆", 315_000));
+        assert!(!plausible(&got, "美秀集團", "小老婆", 0));
+        assert!(plausible(&got, "美秀集團", "捲菸", 232_400));
+    }
+
+    #[test]
+    fn translated_title_passes_on_artist_and_tight_duration() {
+        let got = c(1, "アイドル", "YOASOBI", 213_800);
+        assert!(plausible(&got, "YOASOBI", "Idol", 213_500));
+        assert!(!plausible(&got, "YOASOBI", "Idol", 216_000));
     }
 
 }

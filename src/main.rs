@@ -31,6 +31,7 @@ mod oauth;
 mod player;
 mod preset;
 mod prefs;
+mod pv;
 mod quad;
 mod scene_about;
 mod scene_flow;
@@ -174,6 +175,9 @@ struct Trans {
     /// 封面流、歌詞頁、替身各自去讀時鐘的話，中間隔著別頁的繪圖時間，
     /// 會出現「封面流還在藏中央那張、替身卻已經落地收掉」的那一幀 —— 中央整個空掉，看起來就是閃一下
     now: f32,
+    /// 按下去那一刻的 chrome。離開歌詞頁的途中 PV 左欄照這個畫：到了封面流控制列會升起來，
+    /// 跟著升的話留在原地淡出的唱片會一邊變大
+    chrome0: f32,
 }
 
 struct Fly {
@@ -391,6 +395,35 @@ const IDLE_HIDE: Duration = Duration::from_millis(3000);
 const IDLE_FPS: f32 = 60.0;
 const IDLE_AFTER: Duration = Duration::from_millis(3000);
 
+/// 沒在播又沒人動多久之後降到幾 fps（從 `IDLE_AFTER` 的 60 接著往下），最後一段過了就停畫。
+/// 分段是因為一下子停住的話，PV 的光粒、流光會直接凍在半空中，很突兀
+const CALM: [(Duration, f32); 3] =
+    [(Duration::from_secs(20), 60.0), (Duration::from_secs(40), 30.0), (Duration::from_secs(60), 10.0)];
+/// 停畫時多久看一次該不該醒（播放恢復、換歌、poller 有話要說）。這些沒有事件可等
+const PARK_POLL: Duration = Duration::from_millis(200);
+/// 文字 PV 的節拍擷取在這首不能演之後還留多久：切歌時歌詞先變「載入中」，
+/// 下一首有逐字的話馬上又要用，不必關掉重開、節拍重新抓
+const PV_EAR_KEEP: Duration = Duration::from_secs(8);
+
+/// 主視窗這一幀怎麼畫（見 `App::pace`）
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Pace {
+    /// 照更新率上限畫，沒設上限就跟著垂直同步
+    Full,
+    /// 降到大約這個 fps
+    Slow(f32),
+    /// 不畫了，等有事再叫醒（`App::park`）
+    Park,
+}
+
+/// 主視窗停畫的狀態。`hidden`：因為縮小（或被系統判定看不見）才停的，看得見就醒；
+/// `sig`：停的那一刻的播放狀態、曲目、有沒有待顯示的提示，變了就醒
+struct Parked {
+    at: Instant,
+    hidden: bool,
+    sig: (bool, String, bool),
+}
+
 /// 歌詞頁用滾輪捲走、沒再碰歌詞多久之後，捲回正在唱的那句（滑鼠還指著歌詞就一直延後）
 const LYRIC_HOLD: Duration = Duration::from_millis(4000);
 
@@ -413,6 +446,24 @@ const SHOW_S: f32 = theme::dur::SHOW;
 /// 歌詞頁的控制列就是往下收，時間照 CSS 的 `--view-anim`。
 const BAR_SLIDE_S: f32 = theme::dur::BAR_SLIDE;
 
+/// 文字 PV 演的那份歌詞與唱到哪。切歌那一刻共用的歌詞就換成「載入中」了，
+/// 退回一般歌詞頁的那一段要靠這份接著演（位置照本機時鐘往前推）
+struct PvSnap {
+    /// 曲目＋歌詞來源＋句數，變了才重存一份
+    key: String,
+    track: String,
+    lyrics: lyrics::Lyrics,
+    ms: i64,
+    at: Instant,
+    playing: bool,
+}
+
+impl PvSnap {
+    fn ms_now(&self) -> i64 {
+        self.ms + if self.playing { self.at.elapsed().as_millis() as i64 } else { 0 }
+    }
+}
+
 struct Render {
     surface: wgpu::Surface<'static>,
     surf_config: wgpu::SurfaceConfiguration,
@@ -427,6 +478,8 @@ struct Render {
     veil: scene_flow::Veil,
     /// 轉場時第二個視圖畫在這裡再疊上去。用到才建，轉場完就丟
     layer: Option<gfx::Offscreen>,
+    /// 文字 PV（實驗中）。第一次打開才建，沒開過就零開銷
+    pv: Option<pv::Pv>,
     /// 迷你視窗在 Win11 走交換鏈，要同一個 instance 與介面卡開 surface
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -566,6 +619,16 @@ struct App {
     chrome: f32,
     /// 上面那個的線性版本。緩動不能直接套在自己身上，不然方向一換就會跳。
     chrome_t: f32,
+    /// 文字 PV 鎖定的風格（O 鍵輪），`None` 照段落自動換。不存檔
+    pv_look: Option<pv::style::Look>,
+    /// 一般歌詞頁換成文字 PV 的進度（1 = PV）。目標是 `pv_want`
+    pv_mix: anim::Tween,
+    /// 現在該不該是 PV：開著、這首的歌詞有時間軸、切歌後待滿 `pv::HOLD_S`
+    pv_want: bool,
+    /// 上次看到的曲目與換到它的時刻
+    pv_track: (String, Instant),
+    /// PV 演的那份歌詞（見 [`PvSnap`]），退回一般歌詞頁之後清掉
+    pv_snap: Option<PvSnap>,
     last_mouse: Instant,
     /// 游標位置（實體像素，跟畫面座標同一套）
     cursor: (f32, f32),
@@ -578,6 +641,15 @@ struct App {
     /// 主視窗或設定視窗最後一次有輸入的時間；設定視窗有沒有焦點。閒置降幀用（`IDLE_FPS`）
     last_input: Instant,
     prefs_focused: bool,
+    /// 畫面上最後一次有東西該動的時間：播放中、換歌、提示、視窗被叫回來。
+    /// 跟 `last_input` 取較近的那個，算沒在播又沒人動多久（`CALM`）
+    stir: Instant,
+    /// 主視窗停畫中（縮小、或暫停太久）。迷你視窗與設定視窗照常
+    parked: Option<Parked>,
+    /// winit 說主視窗看不見（Windows 上是縮小）
+    occluded: bool,
+    /// 文字 PV 最後一次能演（設定開著、這首有逐字或正在退場）的時間，節拍擷取看它（`PV_EAR_KEEP`）
+    pv_ear: Option<Instant>,
     /// 主視窗所在螢幕的更新率與查詢時間（每兩秒重查，拖到別的螢幕會變）
     refresh: Option<(f32, Instant)>,
     /// 設定面板開著沒。它是疊層不是視圖 —— 底下那頁照樣在動。
@@ -1246,7 +1318,7 @@ impl App {
         let pair = matches!((from, v), (View::Browse, View::Now) | (View::Now, View::Browse));
         // 封面流上沒東西（搜尋篩到空的）就沒有替身可飛，退回單純淡入淡出
         let shared = pair && self.album_count() > 0;
-        self.trans = Some(Trans { from, to: v, start: Instant::now(), shared, fly: None, now: 0.0 });
+        self.trans = Some(Trans { from, to: v, start: Instant::now(), shared, fly: None, now: 0.0, chrome0: self.chrome });
         self.view = v;
         if v == View::Viz {
             self.viz.enter();
@@ -1588,14 +1660,28 @@ impl App {
     /// 有人要設定視窗：沒開就開，開著就拉到前面
     /// 依設定（跟隨系統時再讀一次登錄檔）套用外觀，兩個有標題列的視窗也跟著換。
     /// 迷你視窗沒有標題列，畫面又固定深色，不用動
-    /// 閒置降幀時每幀至少隔多久（秒），不用降就是 `None`。視覺效果頁不降：MilkDrop 有自己的
-    /// 幀率設定，兩個時鐘疊在一起會抖；轉場中也不降
-    fn idle_interval(&mut self) -> Option<f32> {
+    /// 這一幀怎麼畫。操作中、視覺效果頁（MilkDrop 有自己的幀率設定，兩個時鐘疊在一起會抖）、
+    /// 轉場中照上限；播放中的文字 PV 也是（含退回一般歌詞頁的那一段）。其他頁閒置降到 `IDLE_FPS`，
+    /// 沒在播又沒人動就照 `CALM` 一段段往下，最後停畫。縮小了直接停
+    fn pace(&self) -> Pace {
+        if self.hidden() {
+            return Pace::Park;
+        }
         let active = (self.focused || (self.prefs_focused && self.prefs.is_some()))
             && self.last_input.elapsed() < IDLE_AFTER;
         if active || self.view == View::Viz || self.trans.is_some() {
-            return None;
+            return Pace::Full;
         }
+        let quiet = self.last_input.elapsed().min(self.stir.elapsed());
+        if quiet < IDLE_AFTER {
+            let pv = self.view == View::Now && (self.pv_want || self.pv_mix.value() > 0.0);
+            return if pv { Pace::Full } else { Pace::Slow(IDLE_FPS) };
+        }
+        CALM.iter().find(|(t, _)| quiet < *t).map_or(Pace::Park, |&(_, fps)| Pace::Slow(fps))
+    }
+
+    /// 這一幀跟上一幀至少隔多久（秒），不用等就是 `None`
+    fn frame_gap(&mut self, pace: Pace) -> Option<f32> {
         if self.refresh.is_none_or(|(_, t)| t.elapsed() > Duration::from_secs(2)) {
             let hz = self.window.as_ref().and_then(|w| w.current_monitor()).and_then(|m| m.refresh_rate_millihertz());
             self.refresh = Some((hz.map_or(60.0, |m| m as f32 / 1000.0).max(1.0), Instant::now()));
@@ -1603,8 +1689,60 @@ impl App {
         let hz = self.refresh.map_or(60.0, |(hz, _)| hz);
         // 睡滿整數格。交換鏈這時有空的緩衝，不會在 Fifo 那裡等，節奏完全由這裡決定
         // （少睡半格的話量出來是 71 fps，不是 60）
-        let n = (hz / IDLE_FPS).round().max(1.0);
-        Some(n / hz)
+        let slow = match pace {
+            Pace::Slow(fps) => Some((hz / fps).round().max(1.0) / hz),
+            _ => None,
+        };
+        // 使用者設的上限要「不超過」，所以無條件進位（180 Hz 選 120 是每兩格一幀 = 90）。
+        // `--fps` 是量測用的，照原本的不對齊
+        let limit = if self.fps_cap > 0.0 {
+            Some(1.0 / self.fps_cap)
+        } else if self.cfg.fps_limit > 0 && self.view != View::Viz {
+            Some((hz / self.cfg.fps_limit as f32 - 0.05).ceil().max(1.0) / hz)
+        } else {
+            None
+        };
+        match (slow, limit) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn hidden(&self) -> bool {
+        self.occluded || self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true))
+    }
+
+    /// 停畫時拿來比對的狀態，見 [`Parked`]
+    fn stir_sig(&self) -> (bool, String, bool) {
+        let (playing, id) = self.player.shared.now.lock().ok()
+            .and_then(|g| g.as_ref().map(|n| (n.playing, n.id.clone())))
+            .unwrap_or_default();
+        let toast = self.player.shared.toast.lock().is_ok_and(|g| g.is_some())
+            || self.updater.toast.lock().is_ok_and(|g| g.is_some());
+        (playing, id, toast)
+    }
+
+    /// 主視窗停畫：不排下一幀、關掉只給畫面用的擷取，迴圈改成定時醒來看一下（`about_to_wait`）
+    fn park(&mut self, el: &ActiveEventLoop) {
+        self.parked = Some(Parked { at: Instant::now(), hidden: self.hidden(), sig: self.stir_sig() });
+        audio::set_pv(false);
+        audio::set_viz(false);
+        el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + PARK_POLL));
+    }
+
+    fn unpark(&mut self, el: &ActiveEventLoop) {
+        if self.parked.take().is_none() {
+            return;
+        }
+        self.stir = Instant::now();
+        el.set_control_flow(ControlFlow::Poll);
+        // 停了多久都不能算進動畫的 dt 與 fps 統計
+        self.last = Instant::now();
+        self.frames = 0;
+        self.fps_at = Instant::now();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 
     fn sync_appearance(&mut self) {
@@ -1836,6 +1974,8 @@ impl App {
             return;
         }
         self.in_tray = true;
+        // 系統列那套自己管迴圈，停畫的狀態用不到了
+        self.parked = None;
         // 迴圈平常是 Poll，靠重繪時的限幀睡眠降速；停畫之後 Poll 會空轉吃滿一顆核心。
         // 縮著的時候改成有事件才醒（系統列點擊、第二份敲門都是事件）
         el.set_control_flow(ControlFlow::Wait);
@@ -1849,6 +1989,7 @@ impl App {
 
     /// 把主視窗叫到最前面：縮小的還原、藏起來的顯示。縮在系統列的話先恢復。
     fn bring_front(&mut self, el: &ActiveEventLoop) {
+        self.unpark(el);
         if self.in_tray {
             self.in_tray = false;
             el.set_control_flow(ControlFlow::Poll);
@@ -1898,6 +2039,10 @@ impl App {
         let Some((n, plain)) = self.player.shared.lyrics.lock().ok()
             .and_then(|g| g.as_ref().map(|l| (l.synced.len(), !l.plain.is_empty())))
         else { return };
+        // 文字 PV 把清單換掉了，捲了也看不到（捲回正在唱的那句之前還會擋到點句跳轉）
+        if n > 0 && self.pv_want {
+            return;
+        }
         if n == 0 {
             // 純文字歌詞照像素捲，一格 3 行
             if plain {
@@ -2362,6 +2507,29 @@ impl App {
                 self.change_item(settings::Item::Vinyl, 1);
                 self.toast(if self.cfg.vinyl { "唱片模式：開" } else { "唱片模式：關" });
             }
+            // 文字 PV（實驗中）。封面流的字母鍵是跳字母，P 只在歌詞頁有作用（視覺效果頁的 p 是 preset 選單）
+            Key::Character(c) if c.as_str().eq_ignore_ascii_case("p") && self.view == View::Now => {
+                // 跟設定視窗那個開關走同一條路，開著的設定視窗才會跟著更新
+                self.set_item(settings::Item::LyricsPv, settings::Edit::Press);
+                let words = self.player.shared.lyrics.lock().ok().is_some_and(|g| g.as_ref().is_some_and(|l| l.has_words()));
+                self.toast(match (self.cfg.lyrics_pv, words) {
+                    (true, true) => "文字 PV（實驗中）：開",
+                    (true, false) => "文字 PV（實驗中）：開，這首沒有逐字歌詞，先維持一般歌詞頁",
+                    (false, _) => "文字 PV（實驗中）：關",
+                });
+            }
+            // 文字 PV 的風格：自動 → 霓虹 → 紙本 → 衝擊 → 故障 → 浮遊 → 自動
+            Key::Character(c) if c.as_str().eq_ignore_ascii_case("o") && self.view == View::Now && self.cfg.lyrics_pv => {
+                use pv::style::LOOKS;
+                self.pv_look = match self.pv_look {
+                    None => Some(LOOKS[0]),
+                    Some(l) => LOOKS.iter().position(|&x| x == l).and_then(|i| LOOKS.get(i + 1)).copied(),
+                };
+                self.toast(match self.pv_look {
+                    Some(l) => format!("PV 風格：{}", l.name()),
+                    None => "PV 風格：自動（照段落換）".to_string(),
+                });
+            }
             // 封面流的字母鍵是跳字母，T 只在歌詞頁有作用
             Key::Character(c) if c.as_str().eq_ignore_ascii_case("t") && self.view == View::Now => {
                 self.cfg.lyrics_trans = !self.cfg.lyrics_trans;
@@ -2467,6 +2635,10 @@ impl App {
             View::Now => {
                 let ly = self.player.shared.lyrics.lock().ok().and_then(|g| g.clone());
                 let empty = scene_now::shows_lrclib(ly.as_ref());
+                // 文字 PV：左欄淡掉的時候不給點（看不到的鍵按到很怪），也沒有可以點的歌詞
+                if self.pv_want {
+                    return (self.chrome > 0.3).then(|| ui::hit_now(&ui::now(fw, fh), self.chrome, empty, mx, my)).flatten();
+                }
                 ui::hit_now(&ui::now(fw, fh), self.chrome, empty, mx, my)
                     .or_else(|| self.lyric_hits.at(mx, my).map(ui::Hit::Lyric))
             }
@@ -2810,6 +2982,7 @@ impl App {
     /// 底部通知列講一句話。
     fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+        self.stir = Instant::now();
     }
 
     /// 設定改動就立刻落地。這些是使用者按鍵直接造成的，不該等到關程式才存。
@@ -2932,7 +3105,14 @@ impl App {
 
     fn draw(&mut self) {
         audio::set_viz(self.view == View::Viz);
+        // 只在這首能演（或剛演完）時擷取，沒逐字的歌設定開著也不開
+        audio::set_pv(
+            self.view == View::Now && self.cfg.lyrics_pv && self.pv_ear.is_some_and(|t| t.elapsed() < PV_EAR_KEEP),
+        );
         let now = self.player.shared.now.lock().ok().and_then(|g| g.clone());
+        if now.as_ref().is_some_and(|n| n.playing) {
+            self.stir = Instant::now();
+        }
         self.sync_playing(&now);
         let from_update = self.updater.toast.lock().ok().and_then(|mut g| g.take());
         if let Some(m) = from_update {
@@ -3039,6 +3219,44 @@ impl App {
             Some(t) if n.duration_ms > 0 => (t as f64 * n.duration_ms as f64) as i64,
             _ => n.progress_ms + if n.playing { n.at.elapsed().as_millis() as i64 } else { 0 },
         });
+        // 文字 PV 與一般歌詞頁之間：切歌時不知道下一首有沒有時間軸，一律先退回一般歌詞頁，
+        // 至少待 `HOLD_S`，歌詞到了、有逐字才再漫回 PV（只有逐句的不演）。進出都補間，不硬切
+        {
+            let id = now.as_ref().map_or("", |n| n.id.as_str());
+            if id != self.pv_track.0 {
+                self.pv_track = (id.to_string(), Instant::now());
+                self.stir = Instant::now();
+            }
+            let guard = self.player.shared.lyrics.lock().ok();
+            let synced = guard.as_ref().and_then(|g| g.as_ref()).filter(|l| l.has_words());
+            let held = self.pv_track.1.elapsed().as_secs_f32() >= pv::HOLD_S;
+            self.pv_want = self.cfg.lyrics_pv && held && synced.is_some();
+            if self.cfg.lyrics_pv && (synced.is_some() || self.pv_mix.value() > 0.0) {
+                self.pv_ear = Some(Instant::now());
+            }
+            if self.pv_want
+                && let Some(ly) = synced {
+                    // 演的那份另外存一份：切歌那一刻共用的歌詞就換成「載入中」了，退場還要接著演
+                    let key = format!("{id}|{}|{}|{}", ly.source, ly.provider, ly.synced.len());
+                    let ms = pos_now + lyrics::shift(&self.cfg, Some(ly));
+                    let playing = now.as_ref().is_some_and(|n| n.playing);
+                    match self.pv_snap.as_mut() {
+                        Some(s) if s.key == key => (s.ms, s.at, s.playing) = (ms, Instant::now(), playing),
+                        _ => self.pv_snap = Some(PvSnap { key, track: id.to_string(), lyrics: ly.clone(), ms, at: Instant::now(), playing }),
+                    }
+                }
+            drop(guard);
+            let to = if self.pv_want { 1.0 } else { 0.0 };
+            // 不在歌詞頁就直接到位，切回歌詞頁時交給頁面轉場
+            if self.view == View::Now {
+                self.pv_mix.set(to);
+            } else {
+                self.pv_mix.jump(to);
+            }
+            if self.pv_mix.value() <= 0.0 && !self.pv_want {
+                self.pv_snap = None;
+            }
+        }
         let roll = {
             let key = format!("{:?}|{}", self.view, now.as_ref().map_or("", |n| n.id.as_str()));
             if key != self.roll_at.0 {
@@ -3080,22 +3298,39 @@ impl App {
         } else {
             r.layer = None;
         }
+        // 歌詞頁那一端的落點。PV 模式控制項收起來時唱片縮在左上角，要照歌詞頁這一幀實際畫的位置算，
+        // 不然替身會從（往）一般歌詞頁的大唱片位置飛，看起來像瞬移
+        let now_end = self.trans.as_ref().filter(|t| t.shared).map(|_| {
+            let (fw, fh) = gfx::logical(tw, th);
+            let nl = ui::now(fw, fh);
+            let mix = self.pv_mix.value();
+            let pvc = self
+                .pv_snap
+                .as_ref()
+                .filter(|s| mix > 0.0 && !s.lyrics.synced.is_empty())
+                .map(|_| {
+                    let ch = self.trans.as_ref().filter(|t| t.from == View::Now).map_or(self.chrome, |t| t.chrome0);
+                    scene_now::pv_chrome(mix, ch)
+                });
+            let art = scene_now::art_box(&nl, fh, pvc);
+            let s = art.w;
+            // 唱片模式落在中央那圈標籤（唱片直徑 86% 的 62%），不然就是整張方形封面
+            if self.cfg.vinyl {
+                let label = ui::Rect::new(art.x + 0.1634 * s, art.y + 0.3034 * s, 0.5332 * s, 0.5332 * s);
+                (label, label.w * 0.5)
+            } else {
+                (art, theme::radius::CARD * (s / nl.art.w))
+            }
+        });
         // 替身的起訖，第一幀算一次
-        if let Some(tr) = self.trans.as_mut().filter(|t| t.shared && t.fly.is_none()) {
+        if let Some(tr) = self.trans.as_mut().filter(|t| t.shared && t.fly.is_none())
+            && let Some((label, label_r)) = now_end
+        {
             let (fw, fh) = gfx::logical(tw, th);
             let fl = ui::flow(fw, fh, self.cfg.cover_scale);
             let cp = fl.cover_px;
             let cover = ui::Rect::new(fl.cx - cp * 0.5, fl.cy - cp * 0.5, cp, cp);
-            let nl = ui::now(fw, fh);
-            let s = nl.art.w;
             let vinyl = self.cfg.vinyl;
-            // 唱片模式落在中央那圈標籤（唱片直徑 86% 的 62%），不然就是整張方形封面
-            let label = if vinyl {
-                ui::Rect::new(nl.art.x + 0.1634 * s, nl.art.y + 0.3034 * s, 0.5332 * s, 0.5332 * s)
-            } else {
-                nl.art
-            };
-            let label_r = if vinyl { label.w * 0.5 } else { 14.0 };
             let ang = if vinyl { self.vinyl.angle } else { 0.0 };
             let centre_tex = match &centre_album {
                 Some(a) if a.art.is_empty() && a.art_sm.is_empty() => r.art.get_cached(&a.id),
@@ -3117,6 +3352,13 @@ impl App {
                 let back = if ang > 180.0 { 360.0 } else { 0.0 };
                 Fly { from: label, to: cover, r0: label_r, r1: 6.0, rot0: ang, rot1: back, img: now_tex, same }
             });
+        }
+        // 往歌詞頁飛的落點每幀跟著重算：PV 的唱片會隨控制列收放，在左上角與原位之間移動。
+        // 回封面流的起點就留在第一幀，那是使用者按下去時看到的位置
+        if let Some(f) = self.trans.as_mut().filter(|t| t.to == View::Now).and_then(|t| t.fly.as_mut())
+            && let Some((label, label_r)) = now_end
+        {
+            (f.to, f.r1) = (label, label_r);
         }
         let mut res: anyhow::Result<()> = Ok(());
         for (layer_view, on_layer) in layers {
@@ -3337,9 +3579,26 @@ impl App {
                     vol_drag: self.vol_drag,
                     vinyl: self.cfg.vinyl.then_some(&self.vinyl),
                 };
-                scene_now::render(
+                let mix = self.pv_mix.value();
+                let pv_in = if let Some(s) = self.pv_snap.as_ref().filter(|_| mix > 0.0) {
+                    let pv = r.pv.get_or_insert_with(|| pv::Pv::new(&r.gpu, gfx::OFFSCREEN_FORMAT));
+                    Some(scene_now::PvIn {
+                        pv,
+                        lyrics: &s.lyrics,
+                        ms: s.ms_now(),
+                        mix,
+                        track: &s.track,
+                        pulse: self.spec.lock().map(|s| s.pulse).unwrap_or_default(),
+                        now: Instant::now(),
+                        chrome: self.trans.as_ref().filter(|t| t.from == View::Now).map_or(self.chrome, |t| t.chrome0),
+                        look: self.pv_look,
+                    })
+                } else {
+                    None
+                };
+                scene_now::render_with(
                     &r.gpu, tgt, &mut r.quads, &mut r.glass, &mut r.text, &nn, self.chrome,
-                    self.hover,
+                    self.hover, pv_in,
                 )
                 .map(|h| self.lyric_hits = h)
             }
@@ -3695,6 +3954,7 @@ impl ApplicationHandler<UserEv> for App {
             surf_config,
             gpu,
             layer: None,
+            pv: None,
             instance,
             adapter,
         };
@@ -3718,9 +3978,17 @@ impl ApplicationHandler<UserEv> for App {
         self.tick_mini();
         self.sync_prefs(el);
         self.tick_prefs();
-        // 縮在系統列時迴圈是 Wait；迷你視窗或設定視窗開著的話要定時醒來，進度條與動畫才會走
-        if self.in_tray {
-            let due = [self.mini.as_ref().map(|m| m.next_due()), self.prefs.as_ref().map(|p| p.next_due())];
+        if let Some(p) = &self.parked
+            && !self.hidden()
+            && (p.hidden || self.last_input > p.at || self.stir > p.at || self.stir_sig() != p.sig)
+        {
+            self.unpark(el);
+        }
+        // 縮在系統列或停畫時迴圈是 Wait；迷你視窗或設定視窗開著的話要定時醒來，進度條與動畫才會走。
+        // 停畫的話還要定時看該不該醒
+        if self.in_tray || self.parked.is_some() {
+            let poll = self.parked.as_ref().map(|_| Instant::now() + PARK_POLL);
+            let due = [self.mini.as_ref().map(|m| m.next_due()), self.prefs.as_ref().map(|p| p.next_due()), poll];
             el.set_control_flow(match due.into_iter().flatten().min() {
                 Some(t) => ControlFlow::WaitUntil(t),
                 None => ControlFlow::Wait,
@@ -3739,6 +4007,13 @@ impl ApplicationHandler<UserEv> for App {
         }
         if is_input(&ev) {
             self.last_input = Instant::now();
+        }
+        // 停畫中的話，這些都要醒來重畫一次（醒不醒在 `about_to_wait` 決定）
+        if matches!(
+            ev,
+            WindowEvent::Focused(_) | WindowEvent::Resized(_) | WindowEvent::Occluded(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) {
+            self.stir = Instant::now();
         }
         // 玻璃要的三個狀態，先記下來再交給底下各自的處理
         match &ev {
@@ -3769,7 +4044,9 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => gfx::set_scale(gfx::zoomed(scale_factor)),
             // 視窗被蓋住就告訴 poller，讓它拉長輪詢間隔省 Spotify 的配額。
             // 這是 Python 版就有的行為（前端回報可見性）。
+            // 主視窗也跟著停畫（`pace`），迷你視窗照常
             WindowEvent::Occluded(hidden) => {
+                self.occluded = hidden;
                 let _ = self.player.tx.send(player::Cmd::Visible(!hidden));
             }
             // 使用者在 Windows 設定改了深淺色：跟隨系統的話要換，沒跟的話 winit 可能把
@@ -3885,13 +4162,14 @@ impl ApplicationHandler<UserEv> for App {
             // 縮在系統列：不畫，也不排下一幀，迴圈就停了。叫回來時 bring_front 再點火
             WindowEvent::RedrawRequested if self.in_tray => {}
             WindowEvent::RedrawRequested => {
+                let pace = self.pace();
+                if pace == Pace::Park {
+                    self.park(el);
+                    return;
+                }
                 // 影格上限。睡到下一格的時間點再畫 —— 空轉等待會把一整顆
                 // 核心吃掉，那比不限幀還糟。
-                let mut cap = (self.fps_cap > 0.0).then(|| 1.0 / self.fps_cap);
-                if let Some(t) = self.idle_interval() {
-                    cap = Some(cap.map_or(t, |c| c.max(t)));
-                }
-                if let Some(cap) = cap {
+                if let Some(cap) = self.frame_gap(pace) {
                     let target = Duration::from_secs_f32(cap);
                     let spent = self.last.elapsed();
                     if spent < target {
@@ -4178,6 +4456,9 @@ fn main() -> anyhow::Result<()> {
         let k: f32 = std::env::var("VITRO_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
         gfx::set_scale(k);
         let (w, h) = ((w as f32 * gfx::scale()).round() as u32, (h as f32 * gfx::scale()).round() as u32);
+        if scene.starts_with("pv") {
+            return pv::shot::run(std::path::Path::new(&out), w, h, &scene);
+        }
         return shot::run(std::path::Path::new(&out), w, h, &scene);
     }
 
@@ -4283,6 +4564,11 @@ fn main() -> anyhow::Result<()> {
         screen_mode: ScreenMode::Windowed,
         windowed: None,
         chrome: 1.0,
+        pv_look: None,
+        pv_mix: anim::Tween::new(0.0, pv::MIX_S, anim::EASE),
+        pv_want: false,
+        pv_track: (String::new(), Instant::now()),
+        pv_snap: None,
         chrome_t: 1.0,
         last_mouse: now,
         cursor: (-1.0, -1.0),
@@ -4292,6 +4578,10 @@ fn main() -> anyhow::Result<()> {
         focused: true,
         last_input: now,
         prefs_focused: false,
+        stir: now,
+        parked: None,
+        occluded: false,
+        pv_ear: None,
         refresh: None,
         settings_open: false,
         filtered: None,

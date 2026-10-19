@@ -55,7 +55,14 @@ pub struct Lyrics {
 }
 
 /// 來源鏈每加一種來源就 +1。0 是 Python 版與更早的 Rust 版寫的。
-const CHAIN_VERSION: u8 = 1;
+/// 2：LyricsPlus 的結果開始核對是不是同一首（`unverified`）
+const CHAIN_VERSION: u8 = 2;
+
+/// 2 之前 LyricsPlus 給的逐字沒核對過是不是同一首（曾把美秀集團〈小老婆〉配成〈卷菸〉），
+/// 要重驗一次，重抓空手也不能沿用。酷狗一直有走 `matching::pick`，不用重驗
+fn unverified(c: &Lyrics) -> bool {
+    c.source == "word" && c.provider != "KuGou" && c.chain < 2
+}
 
 /// 比對歌詞要用的總偏移 = 全域設定 + 這首的專屬微調。
 pub fn shift(cfg: &Config, l: Option<&Lyrics>) -> i64 {
@@ -87,6 +94,11 @@ fn safe_name(s: &str) -> String {
 impl Lyrics {
     fn has_content(&self) -> bool {
         !self.synced.is_empty() || !self.plain.is_empty() || self.source == "instrumental"
+    }
+
+    /// 有沒有逐字時間（只要有一句有就算）
+    pub fn has_words(&self) -> bool {
+        self.synced.iter().any(|l| l.words.as_ref().is_some_and(|w| !w.is_empty()))
     }
 }
 
@@ -234,6 +246,34 @@ fn merge_trans(dst: &mut Lyrics, src: &Lyrics) {
     }
 }
 
+/// LyricsPlus 照曲名搜到的那一首，是不是我們要的這首。它搜不到原曲時會回同歌手的別首
+/// （〈小老婆〉回了〈卷菸〉），所以要拿回應的 `metadata` 再核對一次。
+/// 回應沒附曲名就無從核對，照舊收下
+fn lyricsplus_same_song(meta: &serde_json::Value, artist: &str, title: &str, duration_ms: i64) -> bool {
+    let got = meta["title"].as_str().unwrap_or("").trim();
+    if got.is_empty() {
+        return true;
+    }
+    let c = matching::Candidate {
+        id: String::new(),
+        title: got.to_string(),
+        artist: meta["artist"].as_str().unwrap_or("").to_string(),
+        album: meta["album"].as_str().unwrap_or("").to_string(),
+        duration_ms: meta["totalDuration"].as_str().and_then(parse_clock).unwrap_or(0),
+    };
+    matching::plausible(&c, artist, title, duration_ms)
+}
+
+/// `3:52.000`、`232.5` 這類長度轉毫秒
+fn parse_clock(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let secs = match s.split_once(':') {
+        Some((m, rest)) => m.trim().parse::<f64>().ok()? * 60.0 + rest.trim().parse::<f64>().ok()?,
+        None => s.parse::<f64>().ok()?,
+    };
+    (secs > 0.0).then(|| (secs * 1000.0).round() as i64)
+}
+
 pub struct Fetcher {
     pub(crate) http: reqwest::blocking::Client,
     dir: PathBuf,
@@ -334,7 +374,7 @@ impl Fetcher {
 
         // 重抓失敗、或抓到的比手上這份還空，就沿用舊的，並記著這次別再試。
         match (fresh, cached) {
-            (Some(f), Some(mut c)) if !f.has_content() && c.has_content() => {
+            (Some(f), Some(mut c)) if !f.has_content() && c.has_content() && !unverified(&c) => {
                 self.misses.insert(key.to_string());
                 // 問過了、沒有更好的：蓋上版本章，下次就不再問
                 c.chain = CHAIN_VERSION;
@@ -362,7 +402,7 @@ impl Fetcher {
         if self.misses.contains(key) {
             return false; // 這次執行期間已經試過了
         }
-        if cached.source == "word" {
+        if cached.source == "word" && !unverified(cached) {
             return false;
         }
         // 存的是行級，而現在有 LyricsPlus 可以問，值得升級成逐字；
@@ -436,7 +476,9 @@ impl Fetcher {
             vec![("title", title), ("artist", artist)],
         ];
 
-        for attempt in attempts {
+        for (n, attempt) in attempts.into_iter().enumerate() {
+            // 第一次是拿平台 ID 查，查到的就是這首；後兩次是伺服器照曲名搜的，可能搜到同歌手的別首
+            let by_id = n == 0;
             let mut params: Vec<(&str, &str)> =
                 attempt.into_iter().filter(|(_, v)| !v.is_empty()).collect();
             if params.is_empty() {
@@ -461,6 +503,9 @@ impl Fetcher {
                 continue;
             }
             let is_word = data["type"].as_str() == Some("Word");
+            if !by_id && !lyricsplus_same_song(&data["metadata"], artist, title, duration_ms) {
+                continue;
+            }
 
             let mut out = Vec::new();
             for ln in raw_lines {

@@ -40,6 +40,8 @@ pub struct Spectrum {
     /// 有些驅動在沒聲音時照樣送全零的 buffer，Spotify 在別台裝置播的時候
     /// 這台也可能只收到其他程式的微弱雜音，所以「安不安靜」要看振幅。
     pub last_loud: Option<Instant>,
+    /// 節拍（文字 PV 用）。只有 PV 開著時才算
+    pub pulse: crate::pv::beat::Pulse,
 }
 
 /// 安靜多久才說「沒有偵測到聲音」。web 版的 `QUIET_MS`，歌與歌之間的空檔不能觸發它。
@@ -66,6 +68,7 @@ impl Default for Spectrum {
             treb: 0.0,
             alive: false,
             last_loud: None,
+            pulse: Default::default(),
         }
     }
 }
@@ -76,14 +79,20 @@ pub type Shared = Arc<Mutex<Spectrum>>;
 const RMS_BLOCK: usize = 1024;
 
 static VIZ: AtomicBool = AtomicBool::new(false);
+static PV: AtomicBool = AtomicBool::new(false);
 
 /// 畫面端告訴這裡「現在在視覺效果頁」。
 pub fn set_viz(on: bool) {
     VIZ.store(on, Ordering::Relaxed);
 }
 
+/// 畫面端告訴這裡「歌詞頁的文字 PV 開著」：要擷取，而且要抓節拍
+pub fn set_pv(on: bool) {
+    PV.store(on, Ordering::Relaxed);
+}
+
 fn needed() -> bool {
-    VIZ.load(Ordering::Relaxed) || crate::ledfeed::wanted()
+    VIZ.load(Ordering::Relaxed) || PV.load(Ordering::Relaxed) || crate::ledfeed::wanted()
 }
 
 pub fn start() -> Shared {
@@ -150,6 +159,9 @@ fn capture_once(out: &Shared) -> anyhow::Result<()> {
 
     let mut smoothed = [0.0f32; BINS];
     let (mut sq, mut n_sq) = (0.0f32, 0usize);
+    // 節拍：每 HOP 個新取樣餵一次頻譜
+    let mut tracker = crate::pv::beat::Tracker::default();
+    let mut hop = 0usize;
 
     loop {
         // 沒人要了就收掉，回到外面等
@@ -175,6 +187,7 @@ fn capture_once(out: &Shared) -> anyhow::Result<()> {
             window.pop_front();
             window.push_back(mono);
             got = true;
+            hop += 1;
             sq += mono * mono;
             n_sq += 1;
             if n_sq == RMS_BLOCK {
@@ -200,6 +213,19 @@ fn capture_once(out: &Shared) -> anyhow::Result<()> {
             let mags: Vec<f32> =
                 spectrum.iter().map(|c| (c.re * c.re + c.im * c.im).sqrt()).collect();
             write_bins(&mags, &mut smoothed, out);
+            // 一次事件通常不到一個 HOP；跨過幾個就餵幾次（同一份頻譜再餵一次通量是 0，無害）
+            if PV.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                while hop >= crate::pv::beat::HOP {
+                    hop -= crate::pv::beat::HOP;
+                    tracker.push(&mags, now);
+                }
+                if let Ok(mut s) = out.lock() {
+                    s.pulse = tracker.pulse;
+                }
+            } else {
+                hop = 0;
+            }
         }
 
         // 完全沒在播的時候 loopback 不給事件，這裡會 timeout。那不是錯誤，
@@ -211,7 +237,9 @@ fn capture_once(out: &Shared) -> anyhow::Result<()> {
             for v in smoothed.iter_mut() {
                 *v *= 0.85;
             }
+            tracker.silence();
             if let Ok(mut s) = out.lock() {
+                s.pulse = tracker.pulse;
                 s.bins = smoothed;
                 s.alive = false;
                 s.bass = 0.0;

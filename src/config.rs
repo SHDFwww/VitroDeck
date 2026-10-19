@@ -156,6 +156,12 @@ pub struct Config {
     /// 介面倍率（0.8～1.5），乘在系統的縮放上；只有主視窗與設定視窗跟，迷你視窗不跟。Rust 版才有
     #[serde(serialize_with = "f32_short")]
     pub ui_scale: f32,
+    /// 歌詞頁的文字 PV 模式（實驗中，歌詞頁按 P 切換）：全螢幕演出、跟著節拍動。
+    /// 開著時歌詞頁會開 loopback 擷取抓節拍。Rust 版才有
+    pub lyrics_pv: bool,
+    /// 主視窗的畫面更新率上限（0 = 跟隨螢幕）。實際取螢幕更新率能整除、不超過它的值，
+    /// 幀才會平均落在垂直同步上。視覺效果頁照 `viz_fps`。Rust 版才有
+    pub fps_limit: u32,
 
     /// 不認得的欄位原樣留著寫回去。少了這個，存一次設定就會把
     /// Python 版（或之後的版本）的欄位全部刪掉。
@@ -202,6 +208,8 @@ impl Default for Config {
             font_latin: String::new(),
             font_scale: 1.0,
             ui_scale: 1.0,
+            lyrics_pv: false,
+            fps_limit: 0,
             extra: Default::default(),
         }
     }

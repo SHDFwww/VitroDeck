@@ -95,6 +95,13 @@ impl Quad {
         self
     }
 
+    /// 直角矩形，最右邊 `w` px 漸漸淡成透明（貼圖也一起淡）。圓角那格拿來放淡出寬度
+    pub fn fade_right(mut self, w: f32) -> Self {
+        self.border[1] = 5.0;
+        self.radius = [w, 0.0, 0.0, 0.0];
+        self
+    }
+
     /// 換成三角形。`right` 決定指向哪邊，`round` 是尖角的收斂量。
     ///
     /// 播放鍵這種東西不用字型畫 —— `▶` 在 Windows 會被 Segoe UI Emoji

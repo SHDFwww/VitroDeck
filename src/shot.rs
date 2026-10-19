@@ -228,9 +228,9 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
                 Some(b) => crate::gfx::upload_encoded(&gpu, &b, "shot-art").unwrap_or_else(|_| albums[0].art.clone()),
                 None => albums[0].art.clone(),
             };
-            let title = std::env::var("VITRO_TITLE").unwrap_or_else(|_| "一場遊戲一場夢".into());
-            let artist = std::env::var("VITRO_ARTIST").unwrap_or_else(|_| "王傑".into());
-            let ms: i64 = std::env::var("VITRO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(64_300);
+            let title = std::env::var("VITRO_TITLE").unwrap_or_else(|_| demo_title().into());
+            let artist = std::env::var("VITRO_ARTIST").unwrap_or_else(|_| demo_artist().into());
+            let ms: i64 = std::env::var("VITRO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(demo_pos_ms);
             let ly = demo_lyrics();
             let i = crate::scene_now::current_line(&ly, ms).map_or(-1, |i| i as i64);
             let line = |j: i64| ly.synced.get(j as usize).filter(|_| j >= 0).map_or(String::new(), |l| l.text.clone());
@@ -248,7 +248,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
                 title: &title,
                 artist: &artist,
                 pos_ms: ms,
-                dur_ms: 255_333,
+                dur_ms: demo_dur_ms(),
                 has: true,
                 art: Some(art),
                 lyric: lyrics_on.then(|| crate::mini::Lyric { key: "demo", idx, cur: &cur, next: &next, next_in_ms: None }),
@@ -346,28 +346,28 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             let mut vinyl = crate::vinyl::Vinyl::default();
             let lift = std::env::var("VITRO_LIFT").is_ok_and(|v| v == "1");
             for i in 0..900 {
-                vinyl.step(1.0 / 60.0, true, !(lift && i > 880), 64_300.0 / 255_333.0, 3.0);
+                vinyl.step(1.0 / 60.0, true, !(lift && i > 880), demo_pos_ms() as f32 / demo_dur_ms() as f32, 3.0);
             }
             if lift {
                 vinyl.lift = 1.0;
             }
             let vinyl_on = !std::env::var("VITRO_VINYL").is_ok_and(|v| v == "0");
             // `VITRO_MS=<毫秒>` 換歌詞時間點；`VITRO_SCROLL=<句>` 拍換句捲到一半的樣子
-            let ms: i64 = std::env::var("VITRO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(64_300);
+            let ms: i64 = std::env::var("VITRO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(demo_pos_ms);
             let scroll: f32 = std::env::var("VITRO_SCROLL").or_else(|_| std::env::var("VITRO_BROWSE")).ok().and_then(|v| v.parse().ok()).unwrap_or_else(
                 || crate::scene_now::current_line(&ly, ms).map_or(-1.0, |i| i as f32),
             );
             // `VITRO_TITLE`／`VITRO_ARTIST` 換長名字（看捲動字，配 `VITRO_MARQUEE_T`）
-            let title = std::env::var("VITRO_TITLE").unwrap_or_else(|_| "一場遊戲一場夢".into());
-            let artist = std::env::var("VITRO_ARTIST").unwrap_or_else(|_| "王傑".into());
+            let title = std::env::var("VITRO_TITLE").unwrap_or_else(|_| demo_title().into());
+            let artist = std::env::var("VITRO_ARTIST").unwrap_or_else(|_| demo_artist().into());
             let now = crate::scene_now::Now {
                 title: &title,
                 artist: &artist,
-                album: "一場遊戲一場夢",
+                album: demo_title(),
                 art,
-                position_ms: 64_300,
+                position_ms: demo_pos_ms(),
                 lyric_ms: ms,
-                duration_ms: 255_333,
+                duration_ms: demo_dur_ms(),
                 lyrics: Some(&ly),
                 playing: fake_playing(),
                 // 模式鍵開著的樣子（綠色＋小圓點、單曲重複的「1」）也一起拍到
@@ -473,7 +473,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
                 glass.end_frame();
                 crate::scene_viz::render(
                     &gpu, &target, &mut quads, &mut glass, &mut text, &mut v, &spec,
-                    "王傑 — 一場遊戲一場夢", 1.0, 1.0, None, 1.0 / 60.0,
+                    &format!("{} — {}", demo_artist(), demo_title()), 1.0, 1.0, None, 1.0 / 60.0,
                 )?;
             }
             let nq = crate::search::norm(q);
@@ -550,7 +550,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
                 glass.end_frame();
                 crate::scene_viz::render(
                     &gpu, &target, &mut quads, &mut glass, &mut text, &mut v, &spec,
-                    "王傑 — 一場遊戲一場夢", fake_chrome(), 1.0, fake_hover(), 1.0 / 60.0,
+                    &format!("{} — {}", demo_artist(), demo_title()), fake_chrome(), 1.0, fake_hover(), 1.0 / 60.0,
                 )?;
             }
             names.push(v.current_name().to_string());
@@ -581,7 +581,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             }
             crate::scene_viz::render(
                 &gpu, &target, &mut quads, &mut glass, &mut text, &mut v, &spec,
-                "王傑 — 一場遊戲一場夢", fake_chrome(), 1.0, fake_hover(), 1.0 / 60.0,
+                &format!("{} — {}", demo_artist(), demo_title()), fake_chrome(), 1.0, fake_hover(), 1.0 / 60.0,
             )?;
             let bottom = crate::ui::viz(lw, lh).bar.y - 16.0;
             fake_toast(&gpu, &target, &mut quads, &mut glass, &mut text, bottom, true)?;
@@ -879,27 +879,58 @@ fn demo_trans(t: i64) -> Option<String> {
     Some(s.to_string())
 }
 
+/// `VITRO_DEMO=anthem`：示範曲換成中華民國國歌（詞曲皆已進公有領域），給網站截圖用。
+/// 不設的話一切照舊，截圖基準不受影響。
+pub fn anthem() -> bool {
+    std::env::var("VITRO_DEMO").is_ok_and(|v| v == "anthem")
+}
+pub fn demo_title() -> &'static str {
+    if anthem() { "中華民國國歌" } else { "一場遊戲一場夢" }
+}
+pub fn demo_artist() -> &'static str {
+    if anthem() { "程懋筠" } else { "王傑" }
+}
+pub fn demo_pos_ms() -> i64 {
+    if anthem() { 31_000 } else { 64_300 }
+}
+pub fn demo_dur_ms() -> i64 {
+    if anthem() { 58_000 } else { 255_333 }
+}
+
 /// 給 `--shot now` 用的假歌詞（自己寫的，不是哪首歌）。刻意混中英與長短句。
 fn demo_lyrics() -> crate::lyrics::Lyrics {
-    let lines = [
-        (35_100, "窗外的雨還沒有停"),
-        (39_400, "我把燈關掉又重新打開"),
-        (44_100, "城市在很遠的地方醒來"),
-        (49_000, "你在左邊 我在右邊"),
-        (54_200, "不要急著說再見"),
-        (58_900, "我把這首歌留到最後"),
-        (62_000, "那是今晚最後一班列車"),
-        (67_100, "你在左邊 我在右邊"),
-        (72_300, "為什麼月亮走得慢 天又亮得那麼快"),
-        (78_000, "That's just how the night goes"),
-        (82_600, "只是腳步太急"),
-        (87_400, "不要再回頭"),
-    ];
+    let lines: Vec<(i64, &str)> = if anthem() {
+        vec![
+            (5_000, "三民主義 吾黨所宗"),
+            (12_500, "以建民國 以進大同"),
+            (20_000, "咨爾多士 為民前鋒"),
+            (27_500, "夙夜匪懈 主義是從"),
+            (35_000, "矢勤矢勇 必信必忠"),
+            (42_500, "一心一德 貫徹始終"),
+        ]
+    } else {
+        vec![
+            (35_100, "窗外的雨還沒有停"),
+            (39_400, "我把燈關掉又重新打開"),
+            (44_100, "城市在很遠的地方醒來"),
+            (49_000, "你在左邊 我在右邊"),
+            (54_200, "不要急著說再見"),
+            (58_900, "我把這首歌留到最後"),
+            (62_000, "那是今晚最後一班列車"),
+            (67_100, "你在左邊 我在右邊"),
+            (72_300, "為什麼月亮走得慢 天又亮得那麼快"),
+            (78_000, "That's just how the night goes"),
+            (82_600, "只是腳步太急"),
+            (87_400, "不要再回頭"),
+        ]
+    };
+    // 逐字掃光給哪幾行、每行掃多久
+    let (word_a, word_b, span) = if anthem() { (27_500, -1, 7_000) } else { (62_000, 72_300, 4_600) };
     // 逐字只給一行 —— `--shot now` 停在 62 秒，剛好是這行正在唱。
     // 每個字平均分時間，看得出掃光掃到哪就夠了。
     let words_of = |t: i64, s: &str| {
         let n = s.chars().count().max(1) as i64;
-        let per = 4_600 / n;
+        let per = span / n;
         Some(
             s.chars()
                 .enumerate()
@@ -918,7 +949,7 @@ fn demo_lyrics() -> crate::lyrics::Lyrics {
                 t: *t,
                 text: s.to_string(),
                 // 72.3 秒那句夠長，小視窗會折行，拿來驗折行的逐字
-                words: if *t == 62_000 || *t == 72_300 { words_of(*t, s) } else { None },
+                words: if *t == word_a || *t == word_b { words_of(*t, s) } else { None },
                 // VITRO_TRANS 才畫翻譯；有的句子故意不給，看沒有翻譯的那幾句高度對不對
                 trans: demo_trans(*t),
                 ..Default::default()

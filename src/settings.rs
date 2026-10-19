@@ -63,6 +63,10 @@ pub enum Item {
     FontScale,
     /// 介面倍率（主視窗與設定視窗）。只在設定視窗
     UiScale,
+    /// 歌詞頁的文字 PV（實驗中，歌詞頁按 P 也能切）。只在設定視窗
+    LyricsPv,
+    /// 主視窗的畫面更新率上限。只在設定視窗
+    FpsLimit,
 }
 
 /// 字型大小與介面大小的滑桿：一格 5%，80%～150%
@@ -164,6 +168,8 @@ impl Item {
             Item::FontLatin => "英文字型",
             Item::FontScale => "字型大小",
             Item::UiScale => "介面大小",
+            Item::LyricsPv => "文字 PV",
+            Item::FpsLimit => "畫面更新率上限",
         }
     }
 
@@ -194,6 +200,8 @@ impl Item {
             Item::FontLatin => "英文、數字與半形標點",
             Item::FontScale => "手寫體這類偏小的字型可調大",
             Item::UiScale => "迷你視窗不跟著變",
+            Item::LyricsPv => "全螢幕跟著節拍演出，限有逐字歌詞的歌；歌詞頁按 P 也能切換",
+            Item::FpsLimit => "取螢幕更新率能整除的值，例如 180 Hz 選 120 是 90 fps；視覺效果頁照它自己的上限",
             _ => "",
         }
     }
@@ -202,6 +210,7 @@ impl Item {
     pub fn badge(self) -> &'static str {
         match self {
             Item::Appearance => "淺色實驗中",
+            Item::LyricsPv => "實驗中",
             _ => "",
         }
     }
@@ -229,6 +238,7 @@ impl Item {
             Item::LyricsOffset => format!("{:+} ms", cfg.lyrics_offset_ms),
             Item::LyricsTraditional => on_off(cfg.lyrics_traditional),
             Item::Ktv => on_off(cfg.ktv),
+            Item::LyricsPv => on_off(cfg.lyrics_pv),
             Item::Vinyl => on_off(cfg.vinyl),
             Item::VinylRpm => rpm_label(cfg.vinyl_rpm),
             Item::MiniEnabled => on_off(cfg.mini_enabled),
@@ -271,6 +281,8 @@ impl Item {
             Item::FontLatin => cfg.font_latin.clone(),
             Item::FontScale => format!("{:.0}%", cfg.font_scale * 100.0),
             Item::UiScale => format!("{:.0}%", cfg.ui_scale * 100.0),
+            Item::FpsLimit if cfg.fps_limit == 0 => "跟隨螢幕".into(),
+            Item::FpsLimit => format!("{} fps", cfg.fps_limit),
         }
     }
 
@@ -311,6 +323,7 @@ impl Item {
             }
             Item::LyricsTraditional => cfg.lyrics_traditional = !cfg.lyrics_traditional,
             Item::Ktv => cfg.ktv = !cfg.ktv,
+            Item::LyricsPv => cfg.lyrics_pv = !cfg.lyrics_pv,
             Item::Vinyl => cfg.vinyl = !cfg.vinyl,
             Item::VinylRpm => {
                 // 不在刻度上的（Python 版滑桿拉出來的 7 rpm 之類）從最近的那格開始
@@ -332,6 +345,10 @@ impl Item {
                 let i = STEPS.iter().position(|v| *v == cfg.viz_fps).unwrap_or(1) as i32;
                 let n = (i + d).rem_euclid(STEPS.len() as i32) as usize;
                 cfg.viz_fps = STEPS[n];
+            }
+            Item::FpsLimit => {
+                let i = LIMITS.iter().position(|v| *v == cfg.fps_limit).unwrap_or(0) as i32;
+                cfg.fps_limit = LIMITS[(i + d).rem_euclid(LIMITS.len() as i32) as usize];
             }
             Item::VizCategory => {
                 let c = crate::viz::Category::parse_pub(&cfg.viz_category);
@@ -362,7 +379,9 @@ impl Item {
     /// 在設定視窗裡用什麼控件
     pub fn control(self) -> Control {
         match self {
-            Item::Sort | Item::Screen | Item::VizFps | Item::VizCategory | Item::Appearance => Control::Choice,
+            Item::Sort | Item::Screen | Item::VizFps | Item::VizCategory | Item::Appearance | Item::FpsLimit => {
+                Control::Choice
+            }
             // 一格 10%，50%～200%
             Item::CoverScale => Control::Slider { steps: 16, ticks: false },
             // 一格 100ms，±3 秒
@@ -391,6 +410,7 @@ impl Item {
             Item::F11Span => has("span"),
             Item::LyricsTraditional => cfg.lyrics_traditional,
             Item::Ktv => cfg.ktv,
+            Item::LyricsPv => cfg.lyrics_pv,
             Item::Vinyl => cfg.vinyl,
             Item::MiniEnabled => cfg.mini_enabled,
             Item::MiniLocked => cfg.mini_locked,
@@ -413,6 +433,7 @@ impl Item {
             Item::VizFps => v(&["30", "60", "120", "不限"]),
             Item::VizCategory => VIZ_CATS.iter().map(|c| c.label().to_string()).collect(),
             Item::Appearance => APPEARANCES.iter().map(|a| a.label().to_string()).collect(),
+            Item::FpsLimit => v(&["跟隨螢幕", "120", "60", "30"]),
             _ => Vec::new(),
         }
     }
@@ -431,6 +452,7 @@ impl Item {
                 let a = crate::theme::Appearance::parse(&cfg.appearance);
                 APPEARANCES.iter().position(|v| *v == a)
             }
+            Item::FpsLimit => LIMITS.iter().position(|v| *v == cfg.fps_limit),
             _ => None,
         };
         i.filter(|i| *i < self.choices(screens).len()).unwrap_or(0)
@@ -443,6 +465,7 @@ impl Item {
             Item::VizFps => cfg.viz_fps = *FPS.get(i).unwrap_or(&FPS[1]),
             Item::VizCategory => cfg.viz_category = VIZ_CATS.get(i).unwrap_or(&VIZ_CATS[0]).key().to_string(),
             Item::Appearance => cfg.appearance = APPEARANCES.get(i).copied().unwrap_or_default().key().to_string(),
+            Item::FpsLimit => cfg.fps_limit = *LIMITS.get(i).unwrap_or(&LIMITS[0]),
             _ => {}
         }
     }
@@ -538,6 +561,8 @@ pub enum Edit {
 
 const SORTS: [&str; 4] = ["added", "name", "artist", "year"];
 const FPS: [u32; 4] = [30, 60, 120, 0];
+/// 畫面更新率上限的選項，0 = 跟隨螢幕
+const LIMITS: [u32; 4] = [0, 120, 60, 30];
 /// 順序照 `Category::next`（web 版 viz.js 的 CATS）
 const VIZ_CATS: [crate::viz::Category; 5] = {
     use crate::viz::Category as C;
@@ -585,8 +610,9 @@ impl Page {
                 ("視窗", &[I::StartFullscreen, I::Screen, I::F11One, I::F11Span, I::CloseToTray]),
                 ("文字與大小", &[I::FontCjk, I::FontLatin, I::FontScale, I::UiScale]),
                 ("顏色", &[I::Appearance, I::AccentFollow]),
+                ("耗電", &[I::FpsLimit]),
             ],
-            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsTraditional, I::Ktv])],
+            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv])],
             Page::Vinyl => &[("", &[I::Vinyl, I::VinylRpm])],
             Page::Mini => &[("", &[I::MiniEnabled, I::MiniLocked, I::MiniLyrics, I::MiniRecall])],
             Page::Viz => &[("", &[I::VizEnabled]), ("MilkDrop", &[I::VizFps, I::VizCategory, I::VizShaders])],
@@ -629,7 +655,7 @@ mod tests {
         for it in ITEMS {
             assert_eq!(all.iter().filter(|x| *x == it).count(), 1, "{it:?}");
         }
-        assert_eq!(all.len(), ITEMS.len() + 7, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小與介面大小");
+        assert_eq!(all.len(), ITEMS.len() + 9, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV 與更新率上限");
     }
 
     #[test]

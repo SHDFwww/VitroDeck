@@ -188,11 +188,11 @@ impl<'a> NowBar<'a> {
     /// `--shot` 用：假裝正在播第一張的某一首，播到一小段。
     pub fn demo(albums: &'a [Album], playing: bool) -> Self {
         NowBar {
-            title: "一場遊戲一場夢",
-            artist: "王傑",
+            title: crate::shot::demo_title(),
+            artist: crate::shot::demo_artist(),
             art: albums.first().map(|a| a.art.clone()),
-            pos_ms: 64_300,
-            dur_ms: 255_333,
+            pos_ms: crate::shot::demo_pos_ms(),
+            dur_ms: crate::shot::demo_dur_ms(),
             playing,
             shuffle: true,
             repeat: crate::smtc::Repeat::Track,

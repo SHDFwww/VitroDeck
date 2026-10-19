@@ -77,6 +77,29 @@ pub struct LyricPick {
     pub plain_y: f32,
 }
 
+/// 文字 PV 模式（實驗中）要的東西。有給就是 PV 模式：歌詞換成全螢幕演出，
+/// 左欄的封面、曲目資訊與按鍵跟著 `chrome`（滑鼠一陣子沒動就淡出）
+pub struct PvIn<'a> {
+    pub pv: &'a mut crate::pv::Pv,
+    /// 演的是哪份歌詞、唱到哪（已加補償）。平常就是這首的；剛切歌、要退回一般歌詞頁的那一段，
+    /// 是上一首留下來的（`Now::lyrics` 已經換成「載入中」了）
+    pub lyrics: &'a Lyrics,
+    pub ms: i64,
+    /// 一般歌詞頁換成 PV 的進度（0..1，補間過）。0 與 1 之間兩邊都畫：PV 從右邊漫過來、
+    /// 一般的歌詞淡掉；左欄從一般的樣子換成跟著 `chrome`
+    pub mix: f32,
+    pub track: &'a str,
+    pub pulse: crate::pv::beat::Pulse,
+    pub now: std::time::Instant,
+    pub chrome: f32,
+    /// 鎖定的演出風格，`None` 照段落自動換
+    pub look: Option<crate::pv::style::Look>,
+}
+
+/// PV 模式左欄後面那片磨砂：模糊多重（跟其他模糊錯開，快取才不會互蓋）、右緣淡出多寬
+const FROST_SIGMA: f32 = 24.0;
+const FROST_FADE: f32 = 260.0;
+
 /// 這一幀每句歌詞畫在哪，下一次點擊拿來比對。純文字歌詞順便回報最多能捲多少
 #[derive(Clone, Debug, Default)]
 pub struct LyricHits {
@@ -198,7 +221,48 @@ pub fn render(
     bar_alpha: f32,
     hover: Option<Hit>,
 ) -> anyhow::Result<LyricHits> {
+    render_with(gpu, target, quads, glass, text, now, bar_alpha, hover, None)
+}
+
+/// 同 [`render`]，`pv` 有給就是文字 PV 模式
+#[allow(clippy::too_many_arguments)]
+/// 封面（唱片）這一幀畫在哪。PV 模式控制項收起來時，封面不跟著淡掉，縮成左上角一小格繼續轉；
+/// `pv_chrome` 是 PV 模式下左欄的 chrome（已乘過 mix），不是 PV 就給 `None`。
+/// 封面流 ⇄ 歌詞頁的替身也照這個飛，落點才接得上
+pub fn art_box(l: &ui::NowL, fh: f32, pv_chrome: Option<f32>) -> ui::Rect {
+    let a = l.art;
+    let Some(c) = pv_chrome else { return a };
+    let g = c * c * (3.0 - 2.0 * c);
+    let small = (fh * 0.15).clamp(84.0, 150.0);
+    let m = 26.0;
+    let s = small + (a.w - small) * g;
+    ui::Rect::new(m + (a.x - m) * g, m + (a.y - m) * g, s, s)
+}
+
+/// PV 模式下左欄的 chrome：換過來的途中，左欄從一般歌詞頁的樣子（一直都在）慢慢變成跟著 chrome
+pub fn pv_chrome(mix: f32, chrome: f32) -> f32 {
+    1.0 - mix.min(1.0) * (1.0 - chrome)
+}
+
+pub fn render_with(
+    gpu: &Gpu,
+    target: &Offscreen,
+    quads: &mut QuadRenderer,
+    glass: &mut Glass,
+    text: &mut Text,
+    now: &Now<'_>,
+    bar_alpha: f32,
+    hover: Option<Hit>,
+    mut pv: Option<PvIn<'_>>,
+) -> anyhow::Result<LyricHits> {
     let mut hits = LyricHits::default();
+    // PV 只演有時間軸的歌詞；沒有的照原本的右欄說明。完全退回去了也不畫
+    if pv.as_ref().is_some_and(|p| p.lyrics.synced.is_empty() || p.mix <= 0.0) {
+        pv = None;
+    }
+    let pv_on = pv.is_some();
+    // 一般歌詞頁還看得到多少（換成 PV 的途中兩邊都畫）
+    let mix = pv.as_ref().map_or(0.0, |p| p.mix.min(1.0));
     let (w, h) = (target.width, target.height);
     let (fw, fh) = crate::gfx::logical(w, h);
     let l = ui::now(fw, fh);
@@ -233,14 +297,54 @@ pub fn render(
     quads.push_tex(if bd.now_sat != 1.0 { bgq.saturate(bd.now_sat) } else { bgq }, &bg);
     quads.push(Quad::new(0.0, 0.0, fw, fh).color(bd.now_wash));
 
+    // ---- 文字 PV：先畫好背景再疊演出層（壓暗也在演出層裡），左欄跟著 chrome 淡入淡出 ----
+    let ly_a0 = now.fx.lyrics().0;
+    let mut chrome = 1.0;
+    if let Some(p) = pv.as_mut() {
+        {
+            let mut pass = gfx::pass(&mut enc, &target.view, "now-bg-pv", Some(wgpu::Color::BLACK));
+            quads.flush(gpu, &mut pass, w, h);
+        }
+        chrome = pv_chrome(mix, p.chrome);
+        p.pv.render(gpu, &mut enc, target, text, &crate::pv::Input {
+            lyrics: p.lyrics,
+            track: p.track,
+            ms: p.ms,
+            pulse: p.pulse,
+            now: p.now,
+            accent: theme::accent(),
+            alpha: ly_a0,
+            inset: l.lyrics_x * chrome,
+            look: p.look,
+            mix,
+        });
+        // 控制項出來的時候，左欄後面墊一片淺灰磨砂：把演出那一格模糊掉再蒙一層灰，
+        // 右緣很寬地淡進演出裡，看不出一條邊。演出換成米白底的風格時左欄的字也還讀得到
+        let frost_a = chrome * mix;
+        if frost_a > 0.0 {
+            let frost = Arc::new(glass.blur_scene(gpu, &mut enc, target, FROST_SIGMA));
+            let pw = (l.lyrics_x + FROST_FADE * 0.35).min(fw);
+            let fade = FROST_FADE.min(pw);
+            // 模糊那層先壓暗、灰那層蓋得厚：底下是黑底還是米白底，磨砂都落在差不多的灰，白字一直讀得到
+            let mut q = Quad::new(0.0, 0.0, pw, fh).fade_right(fade).saturate(0.6).color([0.55, 0.55, 0.57, frost_a]);
+            q.uv = [0.0, 0.0, pw / fw, 1.0];
+            quads.push_tex(q, &frost);
+            quads.push(Quad::new(0.0, 0.0, pw, fh).fade_right(fade).color([0.47, 0.48, 0.51, 0.6 * frost_a]));
+        }
+    }
+
+    let pv_debug = pv.as_ref().filter(|_| pv_debug()).map(|p| p.pulse);
+
     // ---- 左側：封面與曲目資訊 ----
-    let (ax, ay, art_px) = (l.art.x, l.art.y, l.art.w);
+    let (ax, art_px) = (l.art.x, l.art.w);
+    let b = art_box(&l, fh, pv_on.then_some(chrome));
+    let (bx, by, bs) = (b.x, b.y, b.w);
     match now.vinyl {
-        Some(v) => crate::vinyl::draw(quads, v, ax, ay, art_px, &now.art, now.fx.vinyl()),
+        Some(v) => crate::vinyl::draw(quads, v, bx, by, bs, &now.art, now.fx.vinyl()),
         None if now.fx.hide_art => {}
         None => quads.push_tex(
-            Quad::new(ax, ay, art_px, art_px)
-                .radius(theme::radius::CARD)
+            Quad::new(bx, by, bs, bs)
+                .radius(theme::radius::CARD * (bs / art_px))
                 .cover(1.0, 1.0)
                 .shadow_of(&theme::SHADOW_ART, 1.0),
             &now.art,
@@ -248,7 +352,10 @@ pub fn render(
     }
 
     let (left_a, left_dy) = now.fx.left();
+    let left_a = left_a * chrome;
     let (ly_a, ly_dy) = now.fx.lyrics();
+    // 換成 PV 的途中，一般的歌詞比 PV 漫過來早一點淡掉、往上飄一點（淡到一點點就不給點了）
+    let (ly_a, ly_dy) = if pv_on { (ly_a * (1.0 - mix * 1.4).max(0.0), ly_dy - 24.0 * mix) } else { (ly_a, ly_dy) };
     quads.set_fx(left_a, left_dy);
 
     // 進度條
@@ -294,12 +401,23 @@ pub fn render(
     text.push(&fmt_ms(now.position_ms), ax, l.times_y, 11.5, 15.0, theme::dim(), 400, None, None);
     let (dw, _) = text.measure(&fmt_ms(now.duration_ms), 11.5, 15.0, None);
     text.push(&fmt_ms(now.duration_ms), ax + pw - dw, l.times_y, 11.5, 15.0, theme::dim(), 400, None, None);
+    // `VITRO_PV_DEBUG=1`：右下角寫出抓到的節拍，實測時判斷準不準
+    if let Some(p) = pv_debug {
+        text.set_fx(1.0, 0.0);
+        let bpm = if p.period > 0.0 { 60.0 / p.period } else { 0.0 };
+        let s = format!("BPM {bpm:.1}　信心 {:.2}　鼓點 {:.2}", p.conf, p.hit);
+        let (tw, _) = text.measure(&s, 12.0, 16.0, None);
+        text.push(&s, fw - tw - 16.0, fh - 28.0, 12.0, 16.0, theme::ink(0.7), 400, None, None);
+        text.set_fx(left_a, left_dy);
+    }
 
     // ---- 右側：歌詞 ----
     text.set_fx(ly_a, ly_dy);
     quads.set_fx(ly_a, ly_dy);
     let (lx, lw, mid_y) = (l.lyrics_x, l.lyrics_w, l.lyrics_mid);
     match now.lyrics {
+        // 文字 PV 已經畫過了，而且整個換過去了
+        _ if pv_on && mix >= 1.0 => {}
         Some(ly) if !ly.synced.is_empty() => {
             let cur = current_line(ly, now.lyric_ms);
             let cur_i = cur.map(|i| i as i64).unwrap_or(-1);
@@ -501,7 +619,9 @@ pub fn render(
     text.set_fx(left_a, left_dy);
     quads.set_fx(left_a, left_dy);
     {
-        let mut pass = gfx::pass(&mut enc, &target.view, "now-main", Some(wgpu::Color::BLACK));
+        // PV 模式的背景與演出層已經在上面畫好了，不能清掉
+        let clear = if pv_on { None } else { Some(wgpu::Color::BLACK) };
+        let mut pass = gfx::pass(&mut enc, &target.view, "now-main", clear);
         quads.flush(gpu, &mut pass, w, h);
     }
 
@@ -575,6 +695,12 @@ pub fn render(
     quads.upload(gpu, w, h);
     gpu.queue.submit([enc.finish()]);
     Ok(hits)
+}
+
+/// `VITRO_PV_DEBUG` 有沒有設（只讀一次）
+fn pv_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VITRO_PV_DEBUG").is_some())
 }
 
 pub fn fmt_ms(ms: i64) -> String {

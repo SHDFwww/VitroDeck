@@ -165,11 +165,14 @@ fn vinyl(p: vec2<f32>, r: f32) -> vec3<f32> {
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let half = in.i_rect.zw * 0.5;
-    // border.y 是形狀種類：0=圓角矩形 1=右指三角形 2=左指三角形 3=愛心 4=黑膠唱片。
+    // border.y 是形狀種類：0=圓角矩形 1=右指三角形 2=左指三角形 3=愛心 4=黑膠唱片
+    // 5=右緣漸淡的直角矩形（radius.x 是淡出寬度）。
     // 三角形的「圓角」用 radius.x 當內縮量，收出來的尖角才不會刺。
     let kind = in.i_border.y;
     var sd: f32;
-    if (kind > 3.5) {
+    if (kind > 4.5) {
+        sd = sd_round_box(in.local, half, vec4<f32>(0.0));
+    } else if (kind > 3.5) {
         sd = length(in.local) - half.x;
     } else if (kind > 2.5) {
         // 畫面座標 y 朝下，愛心的座標 y 朝上；整顆縮放到塞進矩形、置中
@@ -207,7 +210,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         rgb = tx.rgb * in.i_color.rgb;
         alpha = tx.a * in.i_color.a;
     }
-    if (kind > 3.5) {
+    if (kind > 4.5) {
+        let f = max(in.i_radius.x, 1.0);
+        alpha = alpha * smoothstep(half.x, half.x - f, in.local.x);
+    } else if (kind > 3.5) {
         rgb = vinyl(in.local, half.x);
         alpha = 1.0;
     }
