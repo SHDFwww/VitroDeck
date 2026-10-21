@@ -49,6 +49,9 @@ pub struct Lyrics {
     /// 快取會被整份覆寫，微調不該跟著消失；它存在 `offsets.json`，抓完才填進來。
     #[serde(skip)]
     pub offset_ms: i64,
+    /// 自動對齊量出來的單曲偏移（`align.json`）。手動的 `offset_ms` 不是 0 時不用
+    #[serde(skip)]
+    pub auto_ms: i64,
     /// 產生這份快取的來源鏈版本。比現在的 `CHAIN_VERSION` 舊的，換到這首時會重抓一次
     /// （新加了來源，舊的行級結果值得試著升級），重抓過就不再問。
     pub chain: u8,
@@ -64,9 +67,9 @@ fn unverified(c: &Lyrics) -> bool {
     c.source == "word" && c.provider != "KuGou" && c.chain < 2
 }
 
-/// 比對歌詞要用的總偏移 = 全域設定 + 這首的專屬微調。
+/// 比對歌詞要用的總偏移 = 全域設定 + 這首的偏移（手動優先，沒有才用自動對齊的）。
 pub fn shift(cfg: &Config, l: Option<&Lyrics>) -> i64 {
-    cfg.lyrics_offset_ms + l.map_or(0, |l| l.offset_ms)
+    cfg.lyrics_offset_ms + l.map_or(0, Lyrics::track_shift)
 }
 
 const OFFSETS_FILE: &str = "offsets.json";
@@ -86,6 +89,20 @@ pub fn set_track_offset(dir: &Path, key: &str, ms: i64) {
     let _ = config::write_json(&dir.join(OFFSETS_FILE), &m);
 }
 
+fn cache_file(dir: &Path, key: &str) -> PathBuf {
+    let safe: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    dir.join(format!("{safe}.json"))
+}
+
+/// 丟掉這首的歌詞快取，下次換到它從頭照來源鏈抓。
+/// 自動對齊撤回誤判時用：誤判那時重抓的結果已經蓋掉原本那份
+pub fn forget(dir: &Path, key: &str) {
+    let _ = std::fs::remove_file(cache_file(dir, key));
+}
+
 /// 檔名不能有的字元換成底線
 fn safe_name(s: &str) -> String {
     s.chars().map(|c| if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() { '_' } else { c }).collect()
@@ -94,6 +111,11 @@ fn safe_name(s: &str) -> String {
 impl Lyrics {
     fn has_content(&self) -> bool {
         !self.synced.is_empty() || !self.plain.is_empty() || self.source == "instrumental"
+    }
+
+    /// 這首的偏移：手動微調優先，沒有才用自動對齊的
+    pub fn track_shift(&self) -> i64 {
+        if self.offset_ms != 0 { self.offset_ms } else { self.auto_ms }
     }
 
     /// 有沒有逐字時間（只要有一句有就算）
@@ -296,11 +318,7 @@ impl Fetcher {
     }
 
     fn cache_path(&self, key: &str) -> PathBuf {
-        let safe: String = key
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-            .collect();
-        self.dir.join(format!("{safe}.json"))
+        cache_file(&self.dir, key)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -314,11 +332,14 @@ impl Fetcher {
         duration_ms: i64,
         platform_id: Option<&str>,
     ) -> Lyrics {
+        // 自動對齊判斷為配錯歌的來源，這首不再用它們（設定關掉時不管）
+        let bad = crate::align::entry(&self.dir, key).filter(|_| crate::align::enabled()).map(|e| e.bad).unwrap_or_default();
         let mut got = match self.local(cfg, key, artist, title) {
             Some(l) => l,
-            None => self.fetch_cached(cfg, key, artist, title, album, duration_ms, platform_id),
+            None => self.fetch_cached(cfg, key, artist, title, album, duration_ms, platform_id, &bad),
         };
         got.offset_ms = read_offsets(&self.dir).get(key).copied().unwrap_or(0);
+        got.auto_ms = crate::align::auto_shift(&self.dir, key, &got);
         got
     }
 
@@ -354,11 +375,14 @@ impl Fetcher {
         album: &str,
         duration_ms: i64,
         platform_id: Option<&str>,
+        bad: &[String],
     ) -> Lyrics {
         let path = self.cache_path(key);
         let cached: Option<Lyrics> = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
+            .and_then(|s| serde_json::from_str(&s).ok())
+            // 配錯歌的那份不能再拿出來用
+            .filter(|c: &Lyrics| !bad.contains(&c.provider));
 
         if let Some(ref c) = cached
             && !self.stale(cfg, key, c) {
@@ -366,7 +390,7 @@ impl Fetcher {
             }
 
         let fresh = self
-            .fetch_fresh(cfg, artist, title, album, duration_ms, platform_id)
+            .fetch_fresh(cfg, artist, title, album, duration_ms, platform_id, bad)
             .map(|mut f| {
                 f.chain = CHAIN_VERSION;
                 f
@@ -410,6 +434,7 @@ impl Fetcher {
         !cfg.lyricsplus_url.trim().is_empty() || cached.chain < CHAIN_VERSION
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fetch_fresh(
         &self,
         cfg: &Config,
@@ -418,11 +443,13 @@ impl Fetcher {
         album: &str,
         duration_ms: i64,
         platform_id: Option<&str>,
+        bad: &[String],
     ) -> Option<Lyrics> {
+        let skip = |p: &str| bad.iter().any(|b| b == p);
         // 逐字來源：自架 LyricsPlus、酷狗。命中後若沒有翻譯，再向網易雲借。
         let mut degraded = false;
-        let mut word = self.lyricsplus(cfg, artist, title, album, duration_ms, platform_id);
-        if word.is_none() && cfg.lyrics_kugou {
+        let mut word = self.lyricsplus(cfg, artist, title, album, duration_ms, platform_id).filter(|l| !skip(&l.provider));
+        if word.is_none() && cfg.lyrics_kugou && !skip("KuGou") {
             match kugou::fetch(&self.http, artist, title, duration_ms) {
                 matching::Outcome::Hit(l) => word = Some(l),
                 matching::Outcome::Miss => {}
@@ -439,12 +466,15 @@ impl Fetcher {
 
         // 行級來源。連不上時不能把「沒有」當成定論：後面的 LRCLIB 若也空手，
         // 就不寫快取，下次換到這首還會再問一次。
-        if cfg.lyrics_netease {
+        if cfg.lyrics_netease && !skip("Netease") {
             match netease::fetch(&self.http, artist, title, duration_ms) {
                 matching::Outcome::Hit(l) => return Some(convert_result(l, cfg)),
                 matching::Outcome::Miss => {}
                 matching::Outcome::Failed => degraded = true,
             }
+        }
+        if skip("LRCLIB") {
+            return Some(Lyrics { source: "none".into(), ..Default::default() });
         }
         let r = self.lrclib(artist, title, album, duration_ms).map(|r| convert_result(r, cfg));
         match r {
@@ -717,6 +747,33 @@ mod tests {
         assert_eq!(f.fetch(&cfg, "k1", "A:B", "曲:名", "", 200_000, None).offset_ms, 0);
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(dir.join("offsets.json"));
+    }
+
+    /// 自動對齊判斷配錯的來源：快取裡那份不再拿出來，重抓也跳過（全跳過時不碰網路，回「沒有」）
+    #[test]
+    fn 配錯的來源不再用() {
+        use super::{Line, Lyrics};
+        let dir = std::env::temp_dir().join(format!("vitro-lyrics-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wrong = Lyrics {
+            synced: vec![Line { t: 1000, text: "別首歌".into(), ..Default::default() }],
+            source: "synced".into(),
+            provider: "KuGou".into(),
+            chain: 2,
+            ..Default::default()
+        };
+        crate::config::write_json(&dir.join("k1.json"), &wrong).unwrap();
+        let cfg = Config { lyrics_netease: false, lyrics_traditional: false, ..Default::default() };
+        let mut f = Fetcher::new(dir.clone());
+        assert_eq!(f.fetch(&cfg, "k1", "A", "B", "", 200_000, None).provider, "KuGou", "還沒判斷前照用快取");
+
+        let e = crate::align::Entry { bad: vec!["KuGou".into(), "LRCLIB".into()], ..Default::default() };
+        crate::config::write_json(&dir.join("align.json"), &std::collections::BTreeMap::from([("k1".to_string(), e)])).unwrap();
+        let l = f.fetch(&cfg, "k1", "A", "B", "", 200_000, None);
+        assert_eq!(l.source, "none", "{} {}", l.provider, l.source);
+        for n in ["k1.json", "align.json"] {
+            let _ = std::fs::remove_file(dir.join(n));
+        }
     }
 
     /// 期望值是 Python 版用的 opencc-python-reimplemented `s2tw` 跑出來的，兩版要一致

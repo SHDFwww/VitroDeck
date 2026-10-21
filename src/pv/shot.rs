@@ -5,7 +5,10 @@
 //! 示範歌詞是自己寫的句子，照 100 BPM 的八分音符排逐字時間；節拍是照同一個速度假造的
 //! （`VITRO_PV_NOBEAT=1` 拿掉，看沒有音訊時的樣子）。`VITRO_CHROME=1` 拍左欄控制項出來的樣子，
 //! `VITRO_ART=<圖檔>` 換封面、`VITRO_ACCENT=e0453a` 換強調色。
-//! 示範歌詞每四句隔一行空行，所以會換段、換風格；`VITRO_PV_LOOK=paper`（neon／paper／impact／glitch／drift／type／pop／sign／cinema／retro）鎖定一種。
+//! 示範歌詞是「主歌、副歌、主歌、副歌、橋段、副歌、尾聲」，段落之間隔空行，所以會換段、換風格，
+//! 副歌三次都是同一個風格；假造的響度副歌高、主歌低（`VITRO_PV_FLAT=1` 拿掉，只看歌詞結構）。
+//! `VITRO_PV_LOOK=paper`（neon／paper／impact／glitch／drift／type／pop／sign／cinema／retro）鎖定一種。
+//! `VITRO_PV_SCENE=depth`（plain／flight／depth／marquee／wall／carousel／mirror／split／pendulum／cascade／vortex／spotlight／echo）整首鎖定一種段落場景（正式執行也認）。
 //! `VITRO_PV_INTRO=毫秒` 把整份歌詞往後推（拉長前奏）、`VITRO_PV_BREAK=毫秒` 在第 8 句後面多空一段間奏，看沒字時的流光。
 //! `VITRO_PV_MIX=進,退`（毫秒，退可省略）：在那個時間點從一般歌詞頁換進 PV、再退回去，看進出的轉場。
 
@@ -41,7 +44,8 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
         Some(b) => crate::gfx::upload_encoded(&gpu, &b, "shot-art").unwrap_or_else(|_| albums[0].art.clone()),
         None => albums[0].art.clone(),
     };
-    let ly = demo();
+    let (ly, loud) = demo();
+    let flat = std::env::var_os("VITRO_PV_FLAT").is_some();
     let dur = ly.synced.last().map_or(60_000, |l| l.t + 6000);
     let chrome: f32 = std::env::var("VITRO_CHROME").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let beats = std::env::var_os("VITRO_PV_NOBEAT").is_none();
@@ -81,7 +85,12 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             fx: Default::default(),
         };
         let at = base + Duration::from_millis(ms.max(0) as u64);
-        let pulse = if beats { fake_pulse(base, ms) } else { Default::default() };
+        let mut pulse = if beats { fake_pulse(base, ms) } else { Default::default() };
+        if !flat {
+            // 最近一秒的平均（真的響度也是平滑過的）
+            pulse.energy = (0..5).map(|j| loud(ms - j * 250)).sum::<f32>() / 5.0;
+            pulse.energy_conf = 0.9;
+        }
         // 從一般歌詞頁換進來、退回去的進度
         let ramp = |from: i64| crate::anim::EASE.at(((ms - from) as f32 / (super::MIX_S * 1000.0)).clamp(0.0, 1.0));
         let mix = match mix_at {
@@ -138,32 +147,30 @@ fn fake_pulse(base: Instant, ms: i64) -> super::beat::Pulse {
         conf: 0.85,
         hit_at: (ms >= FIRST).then(|| at(last)),
         hit: if n.rem_euclid(4) == 0 { 1.0 } else { 0.55 },
+        ..Default::default()
     }
 }
 
 /// 自己寫的示範歌詞。每句兩小節，字落在八分音符上，詞尾拖長；
-/// 第 6 句故意不給逐字，看退回「整句平均分」的樣子。每四句後面接一行空行（段落的分界）
-fn demo() -> Lyrics {
-    let lines = [
-        "霓虹在雨裡慢慢融化",
-        "我們在午夜 奔跑",
-        "心跳 比節拍還快",
-        "Don't let the city sleep",
-        "把今晚 唱到最後一秒",
-        "就算明天 會忘記",
-        "此刻 閃耀吧！",
-        "Light it up tonight",
-        "一起 飛",
-        "風吹過 空蕩的月台",
-        "末班車 載走了夏天",
-        "還沒說出口的 那句話",
-        "Say it before the dawn",
-        "燃燒吧 燃燒吧",
-        "把影子 甩在身後",
-        "Turn it up turn it up",
-        "直到 世界盡頭",
-        "再見 了",
-    ];
+/// 第 6 句故意不給逐字，看退回「整句平均分」的樣子。段落之間接一行空行，
+/// 只有第二段主歌直接接副歌（最後兩句是副歌前的往上推）。
+/// 另外回傳假造的響度（歌詞時間 → 0..1）：副歌響、橋段中等、其他小聲
+fn demo() -> (Lyrics, impl Fn(i64) -> f32) {
+    const CHORUS: [&str; 4] = ["把今晚 唱到最後一秒", "就算明天 會忘記", "此刻 閃耀吧！", "Light it up tonight"];
+    // (句子, 響度, 後面接空行)
+    let mut lines: Vec<(&str, f32, bool)> = Vec::new();
+    let mut add = |ls: &[&'static str], loud: f32, gap: bool| {
+        for (j, l) in ls.iter().enumerate() {
+            lines.push((l, loud, gap && j + 1 == ls.len()));
+        }
+    };
+    add(&["霓虹在雨裡慢慢融化", "我們在午夜 奔跑", "心跳 比節拍還快", "Don't let the city sleep"], 0.3, true);
+    add(&CHORUS, 0.85, true);
+    add(&["風吹過 空蕩的月台", "末班車 載走了夏天", "還沒說出口的 那句話", "Say it before the dawn"], 0.4, false);
+    add(&CHORUS, 0.85, true);
+    add(&["燃燒吧 燃燒吧", "把影子 甩在身後"], 0.6, true);
+    add(&CHORUS, 0.95, true);
+    add(&["直到 世界盡頭", "再見 了"], 0.25, false);
     let half = BEAT / 2;
     let ms_env = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
     let (intro, brk) = (ms_env("VITRO_PV_INTRO"), ms_env("VITRO_PV_BREAK"));
@@ -172,7 +179,7 @@ fn demo() -> Lyrics {
     let mut synced: Vec<Line> = lines
         .iter()
         .enumerate()
-        .map(|(k, s)| {
+        .map(|(k, &(s, _, _))| {
             let t0 = FIRST + k as i64 * BEAT * 8 + shift(k);
             let mut t = t0;
             let mut words = Vec::new();
@@ -198,10 +205,12 @@ fn demo() -> Lyrics {
             Line { t: t0, text: s.to_string(), words: (k != 5).then_some(words), ..Default::default() }
         })
         .collect();
-    // 空行插在第 4、8、12、16 句後面，時間是那句的最後一拍
-    for k in [16usize, 12, 8, 4] {
-        let t = FIRST + k as i64 * BEAT * 8 - BEAT + shift(k - 1);
-        synced.insert(k, Line { t, ..Default::default() });
+    let times: Vec<(i64, f32)> = synced.iter().zip(&lines).map(|(l, x)| (l.t, x.1)).collect();
+    // 空行插在段落最後一句後面，時間是那句的最後一拍
+    for k in (0..lines.len()).rev().filter(|&k| lines[k].2) {
+        let t = FIRST + (k as i64 + 1) * BEAT * 8 - BEAT + shift(k);
+        synced.insert(k + 1, Line { t, ..Default::default() });
     }
-    Lyrics { synced, source: "word".into(), provider: "示範".into(), ..Default::default() }
+    let ly = Lyrics { synced, source: "word".into(), provider: "示範".into(), ..Default::default() };
+    (ly, move |ms: i64| times.iter().rev().find(|x| x.0 <= ms).map_or(0.2, |x| x.1))
 }

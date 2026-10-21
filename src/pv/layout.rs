@@ -44,6 +44,10 @@ pub enum Enter {
     Ignite,
     /// 原地從失焦慢慢對焦、淡入（電影）
     Focus,
+    /// 彈簧：彈出來衝過頭，來回晃兩三下才停
+    Spring,
+    /// 預備動作：先往外退一點再甩進來（-1 從左、1 從右）
+    Whip(f32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -113,6 +117,108 @@ pub enum Deco {
     Corners { cx: f32, cy: f32, w: f32, h: f32, rot: f32, t: i64 },
     /// 墊在最後面的超大淡字（關鍵字的第一個字）
     Ghost { i: usize, cx: f32, cy: f32, size: f32, rot: f32 },
+}
+
+/// 一句的構圖配方：構圖裡看得出差別的那幾樣。整首歌由 [`super::vary`] 配，同一首不重複
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Recipe {
+    pub template: Template,
+    /// 同一個範本的變化（[`sides`]）：疊排齊左／齊右、直書階梯往哪邊、斜線與 Z 字往哪邊、字幕與打字稿擺上中下
+    pub side: u8,
+    pub key_enter: Enter,
+    pub exit: Exit,
+    pub band: bool,
+    pub corners: bool,
+}
+
+/// 範本有幾種變化（0 是原本的樣子）
+pub fn sides(t: Template) -> u8 {
+    match t {
+        Template::Stack | Template::Vertical | Template::Caption | Template::Typed => 3,
+        Template::Diagonal | Template::Zigzag => 2,
+        Template::Slam => 1,
+    }
+}
+
+/// 配方要看的一句的樣子：要畫的字數、詞組數、是不是全是中日文
+#[derive(Clone, Copy, Debug)]
+pub struct Feat {
+    pub n: usize,
+    pub phrases: usize,
+    pub all_cjk: bool,
+}
+
+impl Feat {
+    pub fn of(g: &[GIn]) -> Self {
+        let ph = phrases(g);
+        Self {
+            n: ph.iter().map(Vec::len).sum(),
+            phrases: ph.len(),
+            all_cjk: ph.iter().flatten().all(|&i| is_cjk(g[i].ch) || is_keep_punct(g[i].ch)),
+        }
+    }
+
+    /// 這句擺不擺得進這個範本
+    pub fn fits(&self, t: Template) -> bool {
+        match t {
+            Template::Slam => self.n <= 6,
+            Template::Vertical => self.all_cjk && self.n <= 14 && self.phrases <= 4,
+            Template::Zigzag => self.phrases >= 2,
+            Template::Diagonal => self.n <= 18,
+            Template::Stack | Template::Caption | Template::Typed => true,
+        }
+    }
+}
+
+/// 規劃用的字：沒排版，只有字、時間（寬度當 1 em），拿來量 [`Feat`]
+pub fn probe(ch: char, t: i64, d: i64) -> GIn {
+    let key = CacheKey::new(
+        cosmic_text::fontdb::ID::dummy(),
+        0,
+        1.0,
+        (0.0, 0.0),
+        cosmic_text::Weight::BOLD,
+        cosmic_text::CacheKeyFlags::empty(),
+    )
+    .0;
+    GIn { ch, adv: 1.0, key: (!ch.is_whitespace()).then_some(key), t, d }
+}
+
+/// 這個風格下一句可以用的配方，各帶一個偏好（風格清單裡重複列的範本、進場算偏好）
+pub fn options(st: &Style, f: &Feat) -> Vec<(Recipe, f32)> {
+    fn uniq<T: Copy + PartialEq>(xs: &[T]) -> Vec<(T, usize)> {
+        let mut out: Vec<(T, usize)> = Vec::new();
+        for &x in xs {
+            match out.iter_mut().find(|o| o.0 == x) {
+                Some(o) => o.1 += 1,
+                None => out.push((x, 1)),
+            }
+        }
+        out
+    }
+    let mut out = Vec::new();
+    let keys = uniq(st.key_enters);
+    let exits = uniq(st.exits);
+    for (t, tm) in uniq(st.templates).into_iter().filter(|(t, _)| f.fits(*t)) {
+        let slam = t == Template::Slam;
+        // 置中大字一律用第一種重點進場、不墊色塊也不框
+        let ks: Vec<(Enter, usize)> = if slam { vec![(st.key_enters.first().copied().unwrap_or(Enter::Pop), 1)] } else { keys.clone() };
+        let bands: &[bool] = if slam || st.band_p <= 0.0 { &[false] } else { &[false, true] };
+        let corners: &[bool] = if slam || st.corners_p <= 0.0 { &[false] } else { &[false, true] };
+        for side in 0..sides(t) {
+            for &(key_enter, km) in &ks {
+                for &(exit, _) in &exits {
+                    for &band in bands {
+                        for &c in corners {
+                            let pref = (tm - 1) as f32 + (km - 1) as f32 * 0.5;
+                            out.push((Recipe { template: t, side, key_enter, exit, band, corners: c }, pref));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -203,10 +309,12 @@ pub fn phrases(g: &[GIn]) -> Vec<Vec<usize>> {
     if !cur.is_empty() {
         out.push(cur);
     }
-    // 太長的中文詞組從唱的空檔切
+    // 太長的中文、日文詞組從詞的邊界切
+    let chars: Vec<char> = g.iter().map(|x| x.ch).collect();
+    let lv = super::seg::starts(&chars);
     let mut split = Vec::new();
     for p in out {
-        split_long(g, p, &mut split);
+        split_long(g, &lv, p, &mut split);
     }
     // 英文：一個字一組太碎，短的併起來
     let mut merged: Vec<Vec<usize>> = Vec::new();
@@ -225,23 +333,26 @@ pub fn phrases(g: &[GIn]) -> Vec<Vec<usize>> {
     merged
 }
 
-fn split_long(g: &[GIn], p: Vec<usize>, out: &mut Vec<Vec<usize>>) {
+/// `lv` 是 [`super::seg::starts`]：每個字前面切開好不好
+fn split_long(g: &[GIn], lv: &[u8], p: Vec<usize>, out: &mut Vec<Vec<usize>>) {
     if p.len() <= MAX_CJK || !p.iter().all(|&i| is_cjk(g[i].ch)) {
         out.push(p);
         return;
     }
     let n = p.len();
-    // 在第 k 個字前面切：空檔越長越好，越靠中間越好
-    let best = (2..=n - 2)
+    // 在第 k 個字前面切：先看是不是詞的邊界（不把詞切開），再看唱的空檔越長越好、越靠中間越好。
+    // 切出單獨一個字的扣分，但比切在詞中間好
+    let best = (1..n)
         .max_by_key(|&k| {
             let (a, b) = (&g[p[k - 1]], &g[p[k]]);
-            let gap = b.t - (a.t + a.d);
-            gap * 4 - (k as i64 - n as i64 / 2).abs() * 60
+            let gap = (b.t - (a.t + a.d)).clamp(0, 2000);
+            let lone = if k == 1 || k == n - 1 { 12_000 } else { 0 };
+            lv[p[k]] as i64 * 20_000 - lone + gap * 4 - (k as i64 - n as i64 / 2).abs() * 60
         })
         .unwrap_or(n / 2);
     let (a, b) = p.split_at(best);
-    split_long(g, a.to_vec(), out);
-    split_long(g, b.to_vec(), out);
+    split_long(g, lv, a.to_vec(), out);
+    split_long(g, lv, b.to_vec(), out);
 }
 
 /// 詞組排成一行：回傳每個字的中心 x（從 0 起算，em × size）與整行寬
@@ -260,12 +371,14 @@ fn row(g: &[GIn], p: &[usize], size: f32) -> (Vec<f32>, f32) {
     (xs, x)
 }
 
-/// 構圖一句。`w`、`h` 是畫面大小（邏輯 px），`seed` 換一句就要換；範本、進退場、裝飾照 `st` 的偏好
-pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> Layout {
+/// 構圖一句。`w`、`h` 是畫面大小（邏輯 px），`seed` 換一句就要換；範本、進退場、裝飾照 `st` 的偏好。
+/// 有 `rec`（場景計畫配好的）就照它，這句擺不進它的範本才自己挑
+pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style, rec: Option<&Recipe>) -> Layout {
     let mut rng = Rng::new(seed.wrapping_mul(31).wrapping_add(idx as u64));
     let ph = phrases(g);
-    let n: usize = ph.iter().map(Vec::len).sum();
-    let all_cjk = ph.iter().flatten().all(|&i| is_cjk(g[i].ch) || is_keep_punct(g[i].ch));
+    let feat = Feat::of(g);
+    let rec = rec.filter(|r| feat.fits(r.template));
+    let side = rec.map(|r| r.side);
     let sung_end = g.iter().map(|x| x.t + x.d).max().unwrap_or(0);
 
     // 關鍵詞組：平均每個字唱最久的，最後一組加分（歌詞的重音常在句尾）
@@ -285,18 +398,13 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> 
     let order = st.templates;
     let m = order.len().max(1);
     let step = if m % 2 == 1 { 2 } else { 1 };
-    let ok = |t: Template| match t {
-        Template::Slam => n <= 6,
-        Template::Vertical => all_cjk && n <= 14 && ph.len() <= 4,
-        Template::Zigzag => ph.len() >= 2,
-        Template::Diagonal => n <= 18,
-        Template::Stack | Template::Caption | Template::Typed => true,
-    };
     let start = (seed % m as u64) as usize + idx * step;
     // 這格不適合就往後找，但先跳過前後句會用的那兩格（不然跟隔壁句撞成一樣）
     let near = |o: usize| o == step % m || o == (m - step % m) % m;
     let offs = std::iter::once(0).chain((1..m).filter(|&o| !near(o))).chain((1..m).filter(|&o| near(o)));
-    let template = offs.map(|o| order[(start + o) % m]).find(|t| ok(*t)).unwrap_or(Template::Stack);
+    let template = rec
+        .map(|r| r.template)
+        .unwrap_or_else(|| offs.map(|o| order[(start + o) % m]).find(|t| feat.fits(*t)).unwrap_or(Template::Stack));
     let pick = |rng: &mut Rng, xs: &[Enter]| xs.get((rng.f() * xs.len() as f32) as usize).copied().unwrap_or(Enter::Pop);
     // 字幕、打字稿與「一樣大」的風格不分大小字
     let even = st.even || matches!(template, Template::Slam | Template::Caption | Template::Typed);
@@ -314,7 +422,11 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> 
                 let s = rng.range(1.45, 1.75);
                 if even { 1.0 } else { s }
             };
+            // 亂數照抽，後面的才跟沒配方時一樣
             enters[k] = pick(&mut rng, st.key_enters);
+            if let Some(r) = rec {
+                enters[k] = r.key_enter;
+            }
         } else {
             let small = rng.chance(0.3);
             sizes[k] = if small && !even { 0.68 } else { 1.0 };
@@ -328,6 +440,7 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> 
         }
     }
     let band = template != Template::Slam && rng.chance(st.band_p);
+    let band = rec.map_or(band, |r| r.band && template != Template::Slam);
 
     // ---- 在 em 空間擺好（字級 1 = 1 單位） ----
     // (詞組, 字索引, x, y, 字級, 旋轉)
@@ -351,11 +464,18 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> 
                 let rh = r.iter().map(|&k| sizes[k]).fold(0.0, f32::max);
                 y += rh * 0.56;
                 let slack = maxw - widths[ri];
-                let mut x = match (rng.f() * 3.0) as u32 {
+                let lean = match (rng.f() * 3.0) as u32 {
                     0 => 0.0,
                     1 => slack,
                     _ => slack * 0.5,
-                } + rng.range(-0.4, 0.4);
+                };
+                // 變化 1、2：整塊齊左、齊右（0 是每行各自錯開）
+                let lean = match side {
+                    Some(1) => 0.0,
+                    Some(2) => slack,
+                    _ => lean,
+                };
+                let mut x = lean + rng.range(-0.4, 0.4);
                 for &k in r {
                     let (xs, wk) = row(g, &ph[k], sizes[k]);
                     // 小字的行靠上一點，跟大字錯開
@@ -371,9 +491,16 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> 
         }
         Template::Vertical => {
             let mut x = 0.0;
+            let cols = ph.len().max(2) as f32 - 1.0;
             for (k, p) in ph.iter().enumerate() {
                 let s = sizes[k];
                 let top = rng.range(0.0, 1.4);
+                // 變化 1、2：由右往左一欄比一欄低、一欄比一欄高（0 是各欄亂錯開）
+                let top = match side {
+                    Some(1) => k as f32 / cols * 1.6 + top * 0.15,
+                    Some(2) => (1.0 - k as f32 / cols) * 1.6 + top * 0.15,
+                    _ => top,
+                };
                 x -= s * 0.6;
                 for (j, &i) in p.iter().enumerate() {
                     pts.push((k, i, x, top + (j as f32 + 0.5) * s * 1.02, s, 0.0));
@@ -401,10 +528,21 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> 
                 // 大字跟小字底部對齊（同一條基線）
                 pts.push((k, i, gx, gy - (s - 1.0) * 0.45, s, 0.0));
             }
-            tilt = rng.sign() * rng.range(0.16, 0.3);
+            let sign = rng.sign();
+            let sign = match side {
+                Some(0) => 1.0,
+                Some(_) => -1.0,
+                None => sign,
+            };
+            tilt = sign * rng.range(0.16, 0.3);
         }
         Template::Zigzag => {
             let dir = rng.sign();
+            let dir = match side {
+                Some(0) => 1.0,
+                Some(_) => -1.0,
+                None => dir,
+            };
             let mut cy = 0.0;
             for (k, p) in ph.iter().enumerate() {
                 let (xs, wk) = row(g, p, sizes[k]);
@@ -491,15 +629,23 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> 
     let (bw, bh) = ((x1 - x0).max(0.5), (y1 - y0).max(0.5));
     let max_em = pts.iter().map(|p| p.4).fold(1.0, f32::max);
     let cap = if template == Template::Slam { st.cap + 0.1 } else { st.cap };
-    let k = (w * 0.8 / bw).min(h * 0.64 / bh).min(h * cap / max_em);
+    let k = (w * 0.8 * st.fill / bw).min(h * 0.64 * st.fill / bh).min(h * cap / max_em);
     let (bcx, bcy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
     let cx = w * 0.5 + rng.range(-0.05, 0.05) * w;
     let cy = h * 0.5 + rng.range(-0.04, 0.04) * h;
-    // 字幕正中間；打字稿從左邊一成的地方開始寫
+    // 字幕正中間；打字稿從左邊一成的地方開始寫。變化 1、2 擺到上面、下面三分之一（不超出畫面）
     let (cx, cy) = match template {
         Template::Caption => (w * 0.5, h * 0.5),
         Template::Typed => (w * 0.1 + bw * k * 0.5, cy),
         _ => (cx, cy),
+    };
+    let cy = match (template, side) {
+        (Template::Caption | Template::Typed, Some(s @ (1 | 2))) => {
+            let want = if s == 1 { h * 0.32 } else { h * 0.68 };
+            let half = bh * k * 0.5 + h * 0.06;
+            want.clamp(half.min(h * 0.5), (h - half).max(h * 0.5))
+        }
+        _ => cy,
     };
     let to_screen = |x: f32, y: f32| {
         let (rx, ry) = rot(x, y);
@@ -569,11 +715,13 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style) -> 
     for _ in 0..(rng.f() * 3.0) as u32 {
         rng.chance(0.5);
     }
-    if rng.chance(st.corners_p) && template != Template::Slam {
+    let corners = rng.chance(st.corners_p);
+    if rec.map_or(corners, |r| r.corners) && template != Template::Slam {
         decos.push(Deco::Corners { cx, cy, w: (bw + 0.7) * k, h: (bh + 0.5) * k, rot: tilt, t: t0 - 100 });
     }
 
     let exit = st.exits.get((rng.f() * st.exits.len() as f32) as usize).copied().unwrap_or(Exit::Fade);
+    let exit = rec.map_or(exit, |r| r.exit);
     Layout { glyphs, decos, template, exit, cx, cy, tilt, sung_end }
 }
 
@@ -623,6 +771,26 @@ mod tests {
     }
 
     #[test]
+    fn 長句不把詞切開() {
+        // 「最」和「後」之間停很久，以前會從這裡切
+        let mut g = line("我想要和你一起走到最後", 0, 200);
+        for x in g.iter_mut().skip(10) {
+            x.t += 900;
+        }
+        let p = phrases(&g);
+        assert!(p.iter().any(|p| p.contains(&9) && p.contains(&10)), "{p:?}");
+        // 日文：文節不拆（聞こえた、気が）
+        let g = line("君の声が聞こえた気がしたんだ", 0, 200);
+        let p = phrases(&g);
+        let s: Vec<String> = p.iter().map(|p| p.iter().map(|&i| g[i].ch).collect()).collect();
+        assert!(s.iter().all(|w| w.len() <= MAX_CJK * 3), "{s:?}");
+        let joined = s.join("|");
+        for w in ["聞こえた", "気が", "したんだ"] {
+            assert!(s.iter().any(|x| x.contains(w)), "{w} 被切開了：{joined}");
+        }
+    }
+
+    #[test]
     fn 英文短字併起來() {
         let g = line("That's just how the night goes", 0, 150);
         let p = phrases(&g);
@@ -634,8 +802,8 @@ mod tests {
         let g = line("那是今晚最後一班列車", 1000, 250);
         for idx in 0..12 {
             let st = Style::of(LOOKS[idx % LOOKS.len()]);
-            let a = compose(&g, 42, idx, 1280.0, 720.0, &st);
-            let b = compose(&g, 42, idx, 1280.0, 720.0, &st);
+            let a = compose(&g, 42, idx, 1280.0, 720.0, &st, None);
+            let b = compose(&g, 42, idx, 1280.0, 720.0, &st, None);
             assert_eq!(a.template, b.template);
             for (p, q) in a.glyphs.iter().zip(&b.glyphs) {
                 assert_eq!((p.x, p.y, p.size), (q.x, q.y, q.size));
@@ -653,7 +821,7 @@ mod tests {
         let g = line("你在左邊 我在右邊", 0, 200);
         for look in LOOKS {
             let st = Style::of(look);
-            let ts: Vec<_> = (0..10).map(|i| compose(&g, 7, i, 1280.0, 720.0, &st).template).collect();
+            let ts: Vec<_> = (0..10).map(|i| compose(&g, 7, i, 1280.0, 720.0, &st, None).template).collect();
             for w in ts.windows(2) {
                 assert_ne!(w[0], w[1], "{look:?} {ts:?}");
             }

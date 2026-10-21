@@ -1,10 +1,14 @@
 //! 演出風格：整套配色、構圖偏好、進退場、裝飾與鏡頭力道。
 //!
-//! 一首歌照段落換風格（[`segments`]）：間奏、空行或滿八句就切一段，
-//! 每段挑一個跟前兩段都不一樣的風格，唱得快的段落偏向衝擊、故障、普普、復古，慢的偏向浮遊、紙本、電影。
+//! 一首歌照段落換風格（[`segments`]）：間奏、空行或滿八句就切一段，副歌的頭尾一定切。
+//! 每段配哪個風格由 [`super::vary`] 決定（整首不重複），這裡的 [`weight`]、[`chorus_weight`] 是偏好：
+//! 唱得快的段落偏向衝擊、故障、普普、復古，慢的偏向浮遊、紙本、電影；副歌不用打字、電影。
 //! 跟構圖一樣只看歌詞與曲目，同一首歌每次播換的地方、換成什麼都一樣。
 
-use super::layout::{Enter, Exit, Rng, Template};
+use super::layout::{Enter, Exit, Template};
+use super::plan::Part;
+use super::scene::Scene;
+use super::tint;
 use crate::lyrics::Lyrics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -79,6 +83,8 @@ pub struct Style {
     pub ghost: bool,
     /// 最大的字佔畫面高的幾成
     pub cap: f32,
+    /// 整句最多佔畫面多大（1 是寬八成、高六成四）
+    pub fill: f32,
     /// 鏡頭晃動、色差、閃光、跟拍縮放的倍率
     pub shake: f32,
     pub chroma: f32,
@@ -120,6 +126,8 @@ pub struct Style {
     pub halftone: bool,
     pub grid: bool,
     pub leaks: bool,
+    /// 整套配色轉了幾度色相（[`Style::tinted`]，0 是原本的配色）
+    pub hue: f32,
 }
 
 const WHITE: [f32; 4] = [0.97, 0.97, 0.98, 1.0];
@@ -139,7 +147,7 @@ impl Style {
             stroke: None,
             line: [1.0, 1.0, 1.0, 1.0],
             templates: &[Stack, Diagonal, Vertical, Zigzag, Slam],
-            enters: &[Pop, Drop, Spin, Slide(-1.0), Slide(1.0)],
+            enters: &[Pop, Spring, Drop, Spin, Slide(-1.0), Slide(1.0), Whip(-1.0), Whip(1.0)],
             key_enters: &[Stamp, Stamp, Stamp, Pop, Pop],
             exits: &[Exit::Scatter, Exit::Fall, Exit::Zoom],
             hollow: 0.25,
@@ -147,6 +155,7 @@ impl Style {
             corners_p: 0.4,
             ghost: true,
             cap: 0.24,
+            fill: 1.0,
             shake: 1.0,
             chroma: 1.0,
             flash: 1.0,
@@ -172,6 +181,7 @@ impl Style {
             halftone: false,
             grid: false,
             leaks: false,
+            hue: 0.0,
         };
         match look {
             Look::Neon => neon,
@@ -212,7 +222,7 @@ impl Style {
                 band: Some([1.0, 0.86, 0.1, 1.0]),
                 stroke: Some(([0.0, 0.0, 0.0], 0.07)),
                 templates: &[Slam, Zigzag, Diagonal, Slam, Stack],
-                enters: &[Pop, Stamp, Slide(-1.0), Slide(1.0)],
+                enters: &[Pop, Stamp, Slide(-1.0), Slide(1.0), Whip(-1.0), Whip(1.0)],
                 key_enters: &[Stamp],
                 exits: &[Exit::Zoom, Exit::Scatter],
                 hollow: 0.15,
@@ -320,8 +330,8 @@ impl Style {
                 stroke: Some(([0.08, 0.07, 0.1], 0.08)),
                 line: [0.08, 0.07, 0.1, 1.0],
                 templates: &[Zigzag, Stack, Diagonal, Slam],
-                enters: &[Pop, Drop, Pop],
-                key_enters: &[Pop, Stamp],
+                enters: &[Pop, Drop, Spring, Spring],
+                key_enters: &[Pop, Stamp, Spring],
                 exits: &[Exit::Fall, Exit::Scatter],
                 hollow: 0.0,
                 band_p: 0.35,
@@ -409,7 +419,7 @@ impl Style {
                 band: Some([0.25, 0.9, 1.0, 1.0]),
                 line: [0.3, 0.9, 1.0, 1.0],
                 templates: &[Diagonal, Stack, Slam, Zigzag],
-                enters: &[Slide(-1.0), Slide(1.0), Pop],
+                enters: &[Slide(-1.0), Slide(1.0), Pop, Whip(-1.0), Whip(1.0)],
                 key_enters: &[Pop, Stamp],
                 exits: &[Exit::Zoom, Exit::Fade],
                 hollow: 0.2,
@@ -433,6 +443,106 @@ impl Style {
         }
     }
 
+    /// 主歌收斂、副歌放開：字級與裝飾的多寡照這句在歌裡的位置調。
+    /// 只改機率與大小，不改亂數抽幾次，同一句的構圖其他部分不變
+    pub fn tuned(mut self, part: Part) -> Self {
+        match part {
+            Part::Verse => {
+                self.cap *= 0.88;
+                self.band_p *= 0.6;
+                self.corners_p *= 0.6;
+            }
+            Part::Pre => self.cap *= 0.95,
+            Part::Chorus => {
+                self.cap *= 1.12;
+                self.fill = 1.08;
+                self.band_p = (self.band_p * 1.4).min(0.75);
+                self.corners_p = (self.corners_p * 1.3).min(0.8);
+            }
+        }
+        self
+    }
+
+    /// 場景要的調整：縱深的句子會被推近放大，先排小一點；大字帶、飛越的光塵已經夠滿，不墊超大淡字
+    pub fn scened(mut self, scene: Scene) -> Self {
+        match scene {
+            Scene::Plain => {}
+            Scene::Flight => {
+                self.fill *= 0.85;
+                self.ghost = false;
+            }
+            Scene::Depth => {
+                self.fill *= 0.6;
+                self.cap *= 0.72;
+                self.ghost = false;
+            }
+            Scene::Marquee => {
+                self.cap *= 0.92;
+                self.ghost = false;
+            }
+            Scene::Wall => self.ghost = false,
+            // 轉盤、階梯、分鏡同時有好幾句在畫面上，每句排小一點才不會疊成一團
+            Scene::Carousel | Scene::Cascade => {
+                self.fill *= 0.72;
+                self.cap *= 0.82;
+                self.ghost = false;
+            }
+            Scene::Split | Scene::Pendulum => {
+                self.fill *= 0.88;
+                self.ghost = false;
+            }
+            // 句子收到上半部，下半部留給倒影
+            Scene::Mirror => {
+                self.fill *= 0.82;
+                self.cap *= 0.85;
+                self.ghost = false;
+            }
+            Scene::Vortex => {
+                self.fill *= 0.6;
+                self.cap *= 0.72;
+                self.ghost = false;
+            }
+            // 暗一點、字亮一點，聚光燈才看得出來
+            Scene::Spotlight => {
+                self.glow = self.glow.max(0.35);
+                self.vignette = (self.vignette + 0.2).min(0.7);
+            }
+            // 已經有殘響字了，不再墊超大淡字
+            Scene::Echo => self.ghost = false,
+        }
+        self
+    }
+
+    /// 整套配色轉 `deg` 度色相（亮度不動）。封面強調色要到畫的時候才知道，用 [`Style::spin`] 轉
+    pub fn tinted(mut self, deg: f32) -> Self {
+        let sp = |c: [f32; 4]| tint::spin(c, deg);
+        self.bg = sp(self.bg);
+        self.ink = sp(self.ink);
+        self.key_ink = self.key_ink.map(sp);
+        self.band = self.band.map(sp);
+        self.band_ink = sp(self.band_ink);
+        self.stroke = self.stroke.map(|(c, k)| (tint::spin3(c, deg), k));
+        self.line = sp(self.line);
+        self.vig = tint::spin3(self.vig, deg);
+        self.shadow = self.shadow.map(|(c, x, y)| (sp(c), x, y));
+        self.hue += deg;
+        self
+    }
+
+    /// 封面強調色跟著這段的配色轉（轉完跟字太像就調暗或用原色，見 [`tint::accent`]）
+    pub fn accent(&self, a: [f32; 4]) -> [f32; 4] {
+        tint::accent(a, self)
+    }
+
+    /// 不在配色表裡的顏色（網點、網格、漏光）跟著這段的配色轉
+    pub fn spin(&self, c: [f32; 4]) -> [f32; 4] {
+        tint::spin(c, self.hue)
+    }
+
+    pub fn spin3(&self, c: [f32; 3]) -> [f32; 3] {
+        tint::spin3(c, self.hue)
+    }
+
     /// 字要描邊的話，邊有多粗（px）
     pub fn stroke_w(&self, size: f32) -> f32 {
         self.stroke.map_or(0.0, |(_, k)| (size * k).max(2.0))
@@ -445,55 +555,90 @@ pub struct Segment {
     pub first: usize,
     pub t: i64,
     pub look: Look,
+    /// 副歌的段落
+    pub chorus: bool,
+    /// 這段演什麼場景（[`super::vary::cast`] 配的）
+    pub scene: Scene,
+    /// 這段的配色轉幾度色相（[`super::vary::paint`] 配的）
+    pub hue: f32,
 }
 
-/// 一段最少、最多幾句；兩句開頭隔多久算間奏（ms）
+impl Segment {
+    /// 這段的風格（含配色，不含副歌、場景的調整）
+    pub fn style(&self) -> Style {
+        Style::of(self.look).tinted(self.hue)
+    }
+}
+
+/// 第 `i` 段的風格，超出範圍用霓虹
+pub fn style_at(segs: &[Segment], i: usize) -> Style {
+    segs.get(i).map_or(Style::of(Look::Neon), Segment::style)
+}
+
+/// 一段最少、最多幾句（副歌整段不拆，太長才拆）；兩句開頭隔多久算間奏（ms）
 const SEG_MIN: usize = 4;
 const SEG_MAX: usize = 8;
-const SEG_GAP: i64 = 9000;
+const CHORUS_MAX: usize = 12;
+pub const SEG_GAP: i64 = 9000;
 
-/// 把歌詞切成段落並配好風格。`force` 是使用者鎖定的風格（整首歌只用它）
-pub fn segments(ly: &Lyrics, seed: u64, force: Option<Look>) -> Vec<Segment> {
-    // 先找段落的起點與每段的字數、時長
+/// 把歌詞切成段落（風格與場景由 [`super::vary::cast`] 配）。`parts` 是 [`super::plan::parts`]
+pub fn segments(ly: &Lyrics, parts: &[Part]) -> Vec<Segment> {
+    let chorus = |i: usize| parts.get(i) == Some(&Part::Chorus);
     let mut starts: Vec<usize> = Vec::new();
     let mut count = 0;
-    let mut prev_t: Option<i64> = None;
+    let mut prev: Option<(i64, bool)> = None;
     let mut blank = false;
     for (i, l) in ly.synced.iter().enumerate() {
         if l.text.trim().is_empty() {
             blank = true;
             continue;
         }
-        let gap = prev_t.map_or(0, |p| l.t - p);
-        if starts.is_empty() || count >= SEG_MAX || (count >= SEG_MIN && (blank || gap >= SEG_GAP)) {
+        let gap = prev.map_or(0, |p| l.t - p.0);
+        let flip = prev.is_some_and(|p| p.1 != chorus(i));
+        let max = if chorus(i) { CHORUS_MAX } else { SEG_MAX };
+        if starts.is_empty() || flip || count >= max || (count >= SEG_MIN && (blank || gap >= SEG_GAP)) {
             starts.push(i);
             count = 0;
         }
         count += 1;
-        prev_t = Some(l.t);
+        prev = Some((l.t, chorus(i)));
         blank = false;
     }
-    let mut rng = Rng::new(seed ^ 0x5EC7_0000);
-    let mut out: Vec<Segment> = Vec::with_capacity(starts.len());
-    for (k, &first) in starts.iter().enumerate() {
-        let end = starts.get(k + 1).copied().unwrap_or(ly.synced.len());
-        let lines = &ly.synced[first..end];
-        let chars: usize = lines.iter().map(|l| l.text.chars().filter(|c| !c.is_whitespace()).count()).sum();
-        let t_end = ly.synced.get(end).map_or(lines.last().map_or(0, |l| l.t + 4000), |l| l.t);
-        let secs = ((t_end - ly.synced[first].t) as f32 / 1000.0).max(1.0);
-        let cps = chars as f32 / secs;
-        let recent: Vec<Look> = out.iter().rev().take(2).map(|s| s.look).collect();
-        let look = force.unwrap_or_else(|| pick(&mut rng, cps, &recent));
-        out.push(Segment { first, t: ly.synced[first].t, look });
-    }
-    out
+    starts
+        .into_iter()
+        .map(|first| Segment { first, t: ly.synced[first].t, look: Look::Neon, chorus: chorus(first), scene: Scene::Plain, hue: 0.0 })
+        .collect()
 }
 
-/// 照這段唱得多快挑風格，不跟前兩段一樣（只避上一段的話，常常兩種來回換）
-fn pick(rng: &mut Rng, cps: f32, recent: &[Look]) -> Look {
-    // 每秒幾個字：慢歌大約 2～3，快歌 5 以上
-    let fast = ((cps - 2.5) / 3.0).clamp(0.0, 1.0);
-    let weight = |l: Look| match l {
+/// 第 `k` 段唱得多快（0 慢 .. 1 快）：每秒幾個字，慢歌大約 2～3，快歌 5 以上
+pub fn fast(ly: &Lyrics, segs: &[Segment], k: usize) -> f32 {
+    let first = segs[k].first;
+    let end = segs.get(k + 1).map_or(ly.synced.len(), |s| s.first);
+    let lines = &ly.synced[first..end];
+    let chars: usize = lines.iter().map(|l| l.text.chars().filter(|c| !c.is_whitespace()).count()).sum();
+    let t_end = ly.synced.get(end).map_or(lines.last().map_or(0, |l| l.t + 4000), |l| l.t);
+    let secs = ((t_end - ly.synced[first].t) as f32 / 1000.0).max(1.0);
+    ((chars as f32 / secs - 2.5) / 3.0).clamp(0.0, 1.0)
+}
+
+/// 副歌的風格：放得開、畫面滿的優先；字小、安靜的（打字、電影）不選
+pub fn chorus_weight(l: Look, fast: f32) -> f32 {
+    match l {
+        Look::Neon => 1.4,
+        Look::Impact => 0.9 + 1.2 * fast,
+        Look::Pop => 0.7 + 0.8 * fast,
+        Look::Retro => 0.9 + 0.4 * fast,
+        Look::Glitch => 0.5 + 0.8 * fast,
+        Look::Sign => 1.0,
+        Look::Drift => 0.9 * (1.0 - fast),
+        Look::Paper => 0.5 * (1.0 - fast),
+        Look::Type | Look::Cinema => 0.0,
+    }
+}
+
+/// 主歌的風格
+pub fn weight(l: Look, fast: f32) -> f32 {
+    match l {
         Look::Neon => 1.3,
         Look::Paper => 1.4 - 0.7 * fast,
         Look::Impact => 0.9 + 1.4 * fast,
@@ -504,17 +649,7 @@ fn pick(rng: &mut Rng, cps: f32, recent: &[Look]) -> Look {
         Look::Sign => 1.0,
         Look::Cinema => 1.2 - 0.9 * fast,
         Look::Retro => 0.8 + 0.8 * fast,
-    };
-    let cands: Vec<(Look, f32)> = LOOKS.iter().filter(|l| !recent.contains(l)).map(|&l| (l, weight(l))).collect();
-    let total: f32 = cands.iter().map(|c| c.1).sum();
-    let mut r = rng.f() * total;
-    for &(l, w) in &cands {
-        if r < w {
-            return l;
-        }
-        r -= w;
     }
-    cands.last().map_or(Look::Neon, |c| c.0)
 }
 
 /// 第 `i` 句屬於哪一段
@@ -535,33 +670,40 @@ mod tests {
     }
 
     #[test]
-    fn 間奏切段而且相鄰三段風格都不同() {
+    fn 間奏切段() {
         // 六句、隔 15 秒間奏、再六句
         let mut t: Vec<i64> = (0..6).map(|k| k * 3000).collect();
         t.extend((0..6).map(|k| 33_000 + k * 3000));
-        let s = segments(&lyrics(&t), 7, None);
+        let s = segments(&lyrics(&t), &[]);
         assert_eq!(s.len(), 2, "{s:?}");
         assert_eq!(s[1].first, 6);
-        for seed in 0..40 {
-            let t: Vec<i64> = (0..40).map(|k| k * 2500).collect();
-            let s = segments(&lyrics(&t), seed, None);
-            assert!(s.len() >= 5);
-            for w in s.windows(2) {
-                assert_ne!(w[0].look, w[1].look);
-                assert!(w[1].first - w[0].first <= SEG_MAX);
-            }
-            for w in s.windows(3) {
-                assert_ne!(w[0].look, w[2].look);
-            }
+        let t: Vec<i64> = (0..40).map(|k| k * 2500).collect();
+        let s = segments(&lyrics(&t), &[]);
+        assert!(s.len() >= 5);
+        for w in s.windows(2) {
+            assert!(w[1].first - w[0].first <= SEG_MAX);
         }
+        assert_eq!(segment_of(&s, 0), 0);
+        assert_eq!(segment_of(&s, 39), s.len() - 1);
     }
 
     #[test]
-    fn 鎖定風格整首都用它() {
-        let t: Vec<i64> = (0..20).map(|k| k * 2500).collect();
-        let s = segments(&lyrics(&t), 3, Some(Look::Paper));
-        assert!(s.iter().all(|x| x.look == Look::Paper));
-        assert_eq!(segment_of(&s, 0), 0);
-        assert_eq!(segment_of(&s, 19), s.len() - 1);
+    fn 副歌頭尾一定切段() {
+        // 主歌 6 句、副歌 4 句，輪三次，最後主歌之後連兩次副歌
+        let mut parts = Vec::new();
+        for _ in 0..3 {
+            parts.extend([Part::Verse; 6]);
+            parts.extend([Part::Chorus; 4]);
+        }
+        parts.extend([Part::Verse; 6]);
+        parts.extend([Part::Chorus; 8]);
+        let t: Vec<i64> = (0..parts.len() as i64).map(|k| k * 2500).collect();
+        let s = segments(&lyrics(&t), &parts);
+        assert_eq!(s.iter().filter(|x| x.chorus).count(), 4, "{s:?}");
+        for x in &s {
+            assert_eq!(x.chorus, parts[x.first] == Part::Chorus);
+        }
+        // 最後兩次副歌連在一起（8 句）不拆
+        assert_eq!(s.last().unwrap().first, 36);
     }
 }

@@ -23,3 +23,7 @@ cache/
 /design_tokens.md
 /glass_ref.html
 /RELEASE_NOTES_*.md
+
+# 歌詞對齊的離線實驗與收資料啟動檔
+/tools/align/
+/收集對齊資料.bat

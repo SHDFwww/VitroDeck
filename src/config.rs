@@ -99,6 +99,9 @@ pub struct Config {
     pub lyrics_kugou: bool,
     /// 沒有逐字歌詞時問網易雲音樂（行級歌詞與翻譯）。Rust 版才有
     pub lyrics_netease: bool,
+    /// 播放時用 loopback 量歌詞跟歌聲差多少、自動校正，順便抓配錯歌的歌詞（見 align/）。
+    /// 第一次用時下載 36 MB 的人聲模型。預設關，關著時跟沒有這個功能一樣。Rust 版才有
+    pub lyrics_autoalign: bool,
     /// 指定 LyricsPlus 要用哪些來源。預設排除 apple —— 那條需要 Apple Music
     /// 訂閱，而實測 qq 的逐字覆蓋率反而更好（華語／西洋／日文都中）。
     pub lyricsplus_sources: String,
@@ -185,6 +188,7 @@ impl Default for Config {
             lyrics_trans: true,
             lyrics_kugou: true,
             lyrics_netease: true,
+            lyrics_autoalign: false,
             lyricsplus_sources: "qq,musixmatch,spotify".into(),
             viz_fps: 60,
             viz_category: "all".into(),

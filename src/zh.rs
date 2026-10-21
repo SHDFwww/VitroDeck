@@ -41,7 +41,7 @@ pub fn s2tw(text: &str) -> String {
     run(BuiltinConfig::S2tw, &CC, text)
 }
 
-fn tw2s(text: &str) -> String {
+pub fn tw2s(text: &str) -> String {
     static CC: OnceLock<Option<OpenCC>> = OnceLock::new();
     run(BuiltinConfig::Tw2s, &CC, text)
 }

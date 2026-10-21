@@ -65,6 +65,8 @@ pub enum Item {
     UiScale,
     /// 歌詞頁的文字 PV（實驗中，歌詞頁按 P 也能切）。只在設定視窗
     LyricsPv,
+    /// 播放時聽歌聲自動校正歌詞時間、抓配錯歌的歌詞（`align/`）。只在設定視窗
+    LyricsAutoalign,
     /// 主視窗的畫面更新率上限。只在設定視窗
     FpsLimit,
 }
@@ -169,6 +171,7 @@ impl Item {
             Item::FontScale => "字型大小",
             Item::UiScale => "介面大小",
             Item::LyricsPv => "文字 PV",
+            Item::LyricsAutoalign => "自動對齊歌詞",
             Item::FpsLimit => "畫面更新率上限",
         }
     }
@@ -200,6 +203,7 @@ impl Item {
             Item::FontLatin => "英文、數字與半形標點",
             Item::FontScale => "手寫體這類偏小的字型可調大",
             Item::UiScale => "迷你視窗不跟著變",
+            Item::LyricsAutoalign => "聽播放的聲音校正歌詞時間、換掉配錯歌的歌詞；第一次會下載 36 MB 模型。關掉後量過的校正也不套用",
             Item::LyricsPv => "全螢幕跟著節拍演出，限有逐字歌詞的歌；歌詞頁按 P 也能切換",
             Item::FpsLimit => "取螢幕更新率能整除的值，例如 180 Hz 選 120 是 90 fps；視覺效果頁照它自己的上限",
             _ => "",
@@ -239,6 +243,7 @@ impl Item {
             Item::LyricsTraditional => on_off(cfg.lyrics_traditional),
             Item::Ktv => on_off(cfg.ktv),
             Item::LyricsPv => on_off(cfg.lyrics_pv),
+            Item::LyricsAutoalign => on_off(cfg.lyrics_autoalign),
             Item::Vinyl => on_off(cfg.vinyl),
             Item::VinylRpm => rpm_label(cfg.vinyl_rpm),
             Item::MiniEnabled => on_off(cfg.mini_enabled),
@@ -324,6 +329,7 @@ impl Item {
             Item::LyricsTraditional => cfg.lyrics_traditional = !cfg.lyrics_traditional,
             Item::Ktv => cfg.ktv = !cfg.ktv,
             Item::LyricsPv => cfg.lyrics_pv = !cfg.lyrics_pv,
+            Item::LyricsAutoalign => cfg.lyrics_autoalign = !cfg.lyrics_autoalign,
             Item::Vinyl => cfg.vinyl = !cfg.vinyl,
             Item::VinylRpm => {
                 // 不在刻度上的（Python 版滑桿拉出來的 7 rpm 之類）從最近的那格開始
@@ -411,6 +417,7 @@ impl Item {
             Item::LyricsTraditional => cfg.lyrics_traditional,
             Item::Ktv => cfg.ktv,
             Item::LyricsPv => cfg.lyrics_pv,
+            Item::LyricsAutoalign => cfg.lyrics_autoalign,
             Item::Vinyl => cfg.vinyl,
             Item::MiniEnabled => cfg.mini_enabled,
             Item::MiniLocked => cfg.mini_locked,
@@ -612,7 +619,7 @@ impl Page {
                 ("顏色", &[I::Appearance, I::AccentFollow]),
                 ("耗電", &[I::FpsLimit]),
             ],
-            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv])],
+            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsAutoalign, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv])],
             Page::Vinyl => &[("", &[I::Vinyl, I::VinylRpm])],
             Page::Mini => &[("", &[I::MiniEnabled, I::MiniLocked, I::MiniLyrics, I::MiniRecall])],
             Page::Viz => &[("", &[I::VizEnabled]), ("MilkDrop", &[I::VizFps, I::VizCategory, I::VizShaders])],
@@ -655,7 +662,7 @@ mod tests {
         for it in ITEMS {
             assert_eq!(all.iter().filter(|x| *x == it).count(), 1, "{it:?}");
         }
-        assert_eq!(all.len(), ITEMS.len() + 9, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV 與更新率上限");
+        assert_eq!(all.len(), ITEMS.len() + 10, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV、自動對齊與更新率上限");
     }
 
     #[test]

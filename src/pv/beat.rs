@@ -23,6 +23,11 @@ const EVERY: u32 = 25;
 const BANDS: usize = 48;
 /// 低頻（大鼓）算到第幾個頻段（約 150 Hz）
 const LOW_BANDS: usize = 9;
+/// 音量：平滑的時間常數（秒）、隔幾幀記一筆（約 0.26 秒）、記幾筆（約一分半）、記滿幾筆才算可信（約 10 秒）
+const LOUD_TAU: f32 = 1.2;
+const LOUD_EVERY: u32 = 24;
+const LOUD_HIST: usize = 350;
+const LOUD_TRUST: usize = 40;
 
 /// 給畫面的節拍資訊
 #[derive(Clone, Copy, Debug, Default)]
@@ -36,6 +41,11 @@ pub struct Pulse {
     /// 最近一次鼓點與它的強度（0..1）
     pub hit_at: Option<Instant>,
     pub hit: f32,
+    /// 現在這一段有多響（0..1）：最近一秒多的音量，在最近一分半裡排第幾（百分位）。
+    /// 比的是同一段時間裡的自己，所以跟音量開多大無關；副歌通常比主歌高
+    pub energy: f32,
+    /// `energy` 有多可信（0..1）：剛開始聽、或沒聲音的時候是 0
+    pub energy_conf: f32,
 }
 
 impl Pulse {
@@ -62,6 +72,12 @@ pub struct Tracker {
     conf: f32,
     beat_frame: Option<f64>,
     last_hit: u64,
+    /// 平滑過的音量與它的歷史（算百分位）
+    loud: f32,
+    louds: VecDeque<f32>,
+    loud_tick: u32,
+    /// 百分位每 0.26 秒才算一次；`pulse.energy` 每幀往它靠，畫面才不會一格一格跳
+    energy: f32,
     pub pulse: Pulse,
 }
 
@@ -78,6 +94,10 @@ impl Default for Tracker {
             conf: 0.0,
             beat_frame: None,
             last_hit: 0,
+            loud: 0.0,
+            louds: VecDeque::with_capacity(LOUD_HIST + 1),
+            loud_tick: 0,
+            energy: 0.0,
             pulse: Pulse::default(),
         }
     }
@@ -113,13 +133,34 @@ impl Tracker {
             }
         }
         self.prev = cur;
+        self.loudness(cur.iter().sum::<f32>() / BANDS as f32);
         self.feed(flux, low, now);
+    }
+
+    /// 音量（各頻段對數強度的平均）平滑一秒多，在最近一分半裡排第幾
+    fn loudness(&mut self, v: f32) {
+        let a = 1.0 - (-HOP_S / LOUD_TAU).exp();
+        self.loud += (v - self.loud) * a;
+        self.loud_tick += 1;
+        if self.loud_tick >= LOUD_EVERY {
+            self.loud_tick = 0;
+            if self.louds.len() == LOUD_HIST {
+                self.louds.pop_front();
+            }
+            self.louds.push_back(self.loud);
+            let n = self.louds.len();
+            let below = self.louds.iter().filter(|&&x| x < self.loud).count();
+            self.energy = below as f32 / (n.max(2) - 1) as f32;
+            self.pulse.energy_conf = (n as f32 / LOUD_TRUST as f32).min(1.0);
+        }
+        self.pulse.energy += (self.energy - self.pulse.energy) * (1.0 - (-HOP_S / 0.5).exp());
     }
 
     /// 完全沒聲音（loopback 不給資料）：信心慢慢掉，不要讓畫面照舊的速度一直跳
     pub fn silence(&mut self) {
         self.conf *= 0.8;
         self.pulse.conf = self.conf;
+        self.pulse.energy_conf *= 0.8;
         self.prev = [0.0; BANDS];
     }
 
@@ -309,6 +350,24 @@ mod tests {
             assert!((got - bpm).abs() / bpm < 0.03, "{bpm} BPM 估成 {got}");
             assert!(t.pulse.conf > 0.3, "信心 {}", t.pulse.conf);
         }
+    }
+
+    #[test]
+    fn 響的段落能量高() {
+        // 小聲 20 秒、大聲 8 秒：大聲那段排在最前面，而且可信
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        let frames = (28.0 / HOP_S) as usize;
+        for f in 0..frames {
+            let time = f as f32 * HOP_S;
+            let m = if time < 20.0 { 0.5 } else { 4.0 };
+            let mags = vec![m; 1025];
+            t.push(&mags, t0 + Duration::from_secs_f32(time));
+        }
+        assert!(t.pulse.energy > 0.9, "大聲時 {}", t.pulse.energy);
+        assert!(t.pulse.energy_conf > 0.99);
+        t.silence();
+        assert!(t.pulse.energy_conf < 0.9);
     }
 
     #[test]

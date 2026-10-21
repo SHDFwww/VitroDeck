@@ -1,0 +1,14 @@
+# tinysegmenter 0.1.1 的本機修改版（Cargo.toml 的 [patch.crates-io] 指到這裡）。
+# 只改了 src/constants.rs 的句首句尾記號，原因寫在那裡；其他照原樣。
+[package]
+name = "tinysegmenter"
+version = "0.1.1"
+authors = ["woxtu <woxtup@gmail.com>"]
+description = "Compact Japanese tokenizer"
+license = "MIT"
+repository = "https://github.com/woxtu/rust-tinysegmenter"
+edition = "2015"
+
+[dependencies]
+lazy_static = "1.0"
+maplit = "1.0"

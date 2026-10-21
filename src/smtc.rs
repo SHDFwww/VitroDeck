@@ -40,6 +40,9 @@ pub struct Track {
     pub shuffle: bool,
     pub repeat: Repeat,
     pub track_number: i32,
+    /// Spotify 給的原始時間軸：（Position 毫秒, LastUpdatedTime, 讀的當下），後兩個是 WinRT 時刻（100 ns）。
+    /// 研究位置誤差用（`VITRO_ALIGN_REC`）
+    pub stamp: Option<(i64, i64, i64)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -125,6 +128,7 @@ impl Smtc {
         let tl = s.GetTimelineProperties().ok()?;
         let duration_ms = tl.EndTime().map(|t| t.Duration / 10_000).unwrap_or(0);
         let mut progress_ms = tl.Position().map(|t| t.Duration / 10_000).unwrap_or(0);
+        let stamp = tl.LastUpdatedTime().ok().map(|l| (progress_ms, l.UniversalTime, now_winrt_ticks()));
 
         // position 是「上次更新當下」的值，播放中要自己補上經過的時間，
         // 不然會一直落後。這也是 SMTC 比 Web API 準的地方。
@@ -159,6 +163,7 @@ impl Smtc {
             shuffle: info.IsShuffleActive().and_then(|r| r.Value()).unwrap_or(false),
             repeat,
             track_number: props.TrackNumber().unwrap_or(0),
+            stamp,
             title,
             artist,
             album,

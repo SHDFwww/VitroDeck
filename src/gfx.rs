@@ -203,7 +203,8 @@ pub fn logical(w: u32, h: u32) -> (f32, f32) {
     (w as f32 / s, h as f32 / s)
 }
 
-/// 一張可以被畫上去、也可以被讀回來的離屏材質。
+/// 一張可以被畫上去、也可以被讀回來的離屏材質。複製只是多一份參照，指的是同一張
+#[derive(Clone)]
 pub struct Offscreen {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -239,6 +240,16 @@ impl Offscreen {
         });
         let view = texture.create_view(&Default::default());
         Self { texture, view, width, height }
+    }
+
+    /// 每幀都要、畫完當幀就用不到的離屏（例如先鋪封面再拿去模糊的那張）：大小沒變就沿用 `slot` 裡上一幀的。
+    /// 以前每幀 `new` 一張全畫面的再丟掉，3440×1440 是每幀配置、釋放 20 MB 顯示記憶體。
+    /// 用的人每次都整張清掉重畫，所以沿用跟新開的畫出來一樣
+    pub fn reuse(slot: &mut Option<Offscreen>, device: &wgpu::Device, width: u32, height: u32) -> Self {
+        match slot {
+            Some(o) if o.width == width && o.height == height => o.clone(),
+            _ => slot.insert(Self::new(device, width, height)).clone(),
+        }
     }
 
     /// 把畫好的內容讀回主記憶體。

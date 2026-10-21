@@ -363,6 +363,8 @@ pub struct Glass {
     /// 模糊來回用的暫存。key 是（降取樣倍率, σ）—— 只看倍率的話，
     /// 同一幀裡兩個倍率相同的模糊會寫進同一張材質，先算完的那張會被蓋掉。
     blurs: std::collections::HashMap<(u32, u32), (Offscreen, Offscreen)>,
+    /// 封面流、歌詞頁各一張：背景封面先鋪在上面再拿去模糊（見 `Glass::backdrop_src`）
+    backdrop: [Option<Offscreen>; 2],
     /// 折射用的半解析度清晰圖
     sharp: Option<Offscreen>,
     /// 清晰圖與毛玻璃之間的那層（`theme::SIGMA_GLASS_MID`），跟 `sharp` 一起更新
@@ -664,6 +666,7 @@ impl Glass {
             instances,
             capacity: INITIAL_CAPACITY,
             blurs: std::collections::HashMap::new(),
+            backdrop: [None, None],
             sharp: None,
             mid: None,
             wide: None,
@@ -1014,6 +1017,13 @@ impl Glass {
     ///
     /// `sigma` 就是 CSS `blur()` 裡的那個數字 —— 它是標準差，不是半徑。
     /// 兩者差三倍，當成半徑用的話看起來就只是「有點糊」而不是毛玻璃。
+    /// 背景封面要先鋪滿一張全畫面的離屏、再拿去 `blur_scene`。那張每幀都要、畫完當幀就用不到，
+    /// 所以留著沿用（大小變了才重開）；以前每幀開一張新的再丟掉，3440×1440 是每幀配置、釋放 20 MB。
+    /// `slot` 0 是封面流、1 是歌詞頁（轉場時兩個同一幀都要）
+    pub fn backdrop_src(&mut self, gpu: &Gpu, slot: usize, width: u32, height: u32) -> Offscreen {
+        Offscreen::reuse(&mut self.backdrop[slot], &gpu.device, width, height)
+    }
+
     pub fn blur_scene(
         &mut self,
         gpu: &Gpu,

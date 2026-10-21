@@ -3,16 +3,28 @@
 //! 每句歌詞照 [`layout::compose`] 構圖，字在自己被唱到的時候彈進來，換句時整句飛散退場；
 //! 節拍（[`beat::Pulse`]，loopback 抓的）讓鏡頭跟著鼓點縮放（不抖；鏡頭震只留給置中大字那句的第一下）。
 //! 一首歌照段落換演出風格（[`style`]）：配色、構圖偏好、進退場、裝飾都跟著換，換段時一道斜向刷過去。
+//! 哪幾句是副歌由場景計畫（[`plan`]）決定：副歌字大、鏡頭與鼓點放開；主歌收斂。
+//! 每段的風格＋場景、每句的構圖配方整首不重複（[`vary`]）。
+//! 實際放多開還看 loopback 聽到的響度（[`beat::Pulse::energy`]）。
+//! 換句時鏡頭可能移到下一句擺的地方（[`cam`]），舊句被帶出畫面、新句被帶進來。
+//! 有的段落整段演一個大場面（[`scene`]）：長鏡頭飛越、透視縱深、大字跑馬燈帶、歌詞堆疊牆，副歌優先。
 //! 字形畫法是 SDF（[`sdf`]），所以字可以任意放大、旋轉、傾斜、描邊、發光。
 //!
 //! **畫面是時間的純函數**：同一個歌詞時間、同一組節拍資訊畫出來一定一樣，
-//! 所以 `--shot pv` 可以逐幀輸出、捲回去重播也不會亂。要記的狀態只有構圖快取。
+//! 所以 `--shot pv` 可以逐幀輸出、捲回去重播也不會亂。要記的狀態只有構圖快取，
+//! 與鏡頭對過拍點的落點（快到那句時決定一次就不再變，免得拍點估計一抖鏡頭跟著抖）。
 
 pub mod beat;
+pub mod cam;
 pub mod layout;
+pub mod plan;
+pub mod scene;
 pub mod sdf;
+pub mod seg;
 pub mod shot;
 pub mod style;
+pub mod tint;
+pub mod vary;
 
 use std::collections::HashMap;
 use std::f32::consts::PI;
@@ -22,6 +34,7 @@ use crate::gfx::{self, Gpu, Offscreen};
 use crate::lyrics::Lyrics;
 use crate::text::Text;
 use layout::{Deco, Enter, Exit, GIn, Layout, Placed, Rng, Template};
+use scene::Scene;
 use style::{Look, Segment, Style};
 
 /// 字的粗細。正黑體只有 300／400／700，要更粗沒有
@@ -58,6 +71,8 @@ const SPARK_MS: f32 = 600.0;
 const SHINE_MS: f32 = 520.0;
 /// 倒退鍵刪一個字最多多久（毫秒）
 const ERASE_STEP: f32 = 32.0;
+/// 殘響場景：關鍵字的空心殘響擴散多久（毫秒）
+const ECHO_MS: f32 = 1100.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -174,6 +189,10 @@ struct Line {
     /// 這句開始的時間（歌詞時間軸）與下一句開始的時間
     t0: i64,
     next: i64,
+    /// 進場動作的長度倍率：唱得快的句子動作收短，慢的拉長
+    pace: f32,
+    /// 段落場景要它留到段落結束：(整段一起退場的時間, 下一段開始的時間)
+    until: Option<(i64, i64)>,
 }
 
 /// 畫一幀要的東西
@@ -208,11 +227,14 @@ pub struct Pv {
     /// 構圖快取的鍵（曲目＋歌詞來源＋句數＋畫面大小），變了整個清掉
     cache_for: String,
     lines: HashMap<usize, Line>,
-    segs: Vec<Segment>,
+    plan: plan::Plan,
+    /// 換句的鏡頭對過拍點的落點（句索引 → ms）
+    snap: HashMap<usize, i64>,
 }
 
 impl Pv {
     pub fn new(gpu: &Gpu, format: wgpu::TextureFormat) -> Self {
+        seg::warm();
         let device = &gpu.device;
         let atlas = sdf::Atlas::new(gpu);
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -314,7 +336,7 @@ impl Pv {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { pipeline, bind, cam, instances, capacity, atlas, cache_for: String::new(), lines: HashMap::new(), segs: Vec::new() }
+        Self { pipeline, bind, cam, instances, capacity, atlas, cache_for: String::new(), lines: HashMap::new(), plan: plan::Plan::default(), snap: HashMap::new() }
     }
 
     /// 這一句的構圖，沒算過就算
@@ -329,9 +351,12 @@ impl Pv {
             if g.iter().all(|x| x.key.is_none()) {
                 return None;
             }
-            let st = Style::of(self.segs.get(style::segment_of(&self.segs, i)).map_or(Look::Neon, |s| s.look));
-            let lay = layout::compose(&g, seed, i, w, h, &st);
-            slot.insert(Line { g, lay, st, t0: l.t, next });
+            let tr = self.plan.track(i);
+            let st = self.plan.style(i);
+            let lay = layout::compose(&g, seed, i, w, h, &st, self.plan.recipe(i));
+            let pace = pace_of(&lay);
+            let until = tr.filter(|t| t.scene.persist()).map(|t| (t.exit, t.next));
+            slot.insert(Line { g, lay, st, t0: l.t, next, pace, until });
         }
         self.lines.get(&i)
     }
@@ -352,18 +377,17 @@ impl Pv {
         if key != self.cache_for {
             self.cache_for = key;
             self.lines.clear();
-            self.segs = style::segments(ly, seed, inp.look);
+            self.snap.clear();
+            self.plan = plan::Plan::build(ly, seed, inp.look, w, h);
         }
         self.atlas.begin();
         let ms = inp.ms;
 
-        // 正在唱的那句與前兩句（可能還在退場）
+        // 正在唱的那句與前兩句（可能還在退場）；堆疊牆整段都在
         let cur = crate::scene_now::current_line(ly, ms);
         let mut show: Vec<usize> = Vec::new();
         if let Some(c) = cur {
-            for i in c.saturating_sub(2)..=c {
-                show.push(i);
-            }
+            show.extend(self.plan.keep_from(c, ms)..=c);
         }
         // 構圖只留附近幾句
         self.lines.retain(|k, _| show.contains(k) || cur.is_some_and(|c| *k == c + 1));
@@ -375,20 +399,53 @@ impl Pv {
             self.line(text, ly, c + 1, seed, w, h);
         }
 
-        let beat = Beat::at(&inp.pulse, inp.now);
+        // 強度：結構（主歌、副歌）給底，loopback 聽得到的話照實際的響度調。
+        // 主歌收斂、副歌放開：鏡頭、鼓點、閃光、色差都乘上它
+        let c = inp.pulse.energy_conf * 0.6;
+        let heat = self.plan.level_at(ly, ms) * (1.0 - c) + inp.pulse.energy * c;
+        let amp = 0.6 + 0.8 * heat;
+        let raw = Beat::at(&inp.pulse, inp.now);
+        let beat = raw.scaled(amp);
+        // 換句的鏡頭：快到那句時把落點對齊拍點，決定了就不再變
+        let near: &[usize] = &match cur {
+            Some(c) => vec![c, c + 1],
+            None => vec![0],
+        };
+        let since = if inp.pulse.conf >= 0.4 { inp.pulse.since_beat(inp.now) } else { None };
+        for &j in near {
+            if let Some(s) = self.plan.steps.get(j)
+                && s.mv != cam::Move::Hold
+                && !self.snap.contains_key(&j)
+                && ms as f32 >= s.land as f32 - s.dur - 400.0
+            {
+                self.snap.insert(j, cam::snap(s.land, ms, since, inp.pulse.period));
+            }
+        }
+        self.snap.retain(|&j, _| cur.is_none_or(|c| j + 3 >= c));
+        let view = cam::View::at(&self.plan.steps, cur, ms, |j| self.snap.get(&j).copied().unwrap_or(self.plan.steps[j].land));
+        let center = (w * 0.5, h * 0.5);
         let accent = bright(inp.accent);
         let k = gfx::scale();
         // 現在這段的風格（鏡頭、墊底、全畫面的裝飾照它）；第一句之前算第一段。
         // 下一段的轉場已經開始刷了，就提早算新的那段
-        let mut si = cur.map_or(0, |c| style::segment_of(&self.segs, c)).min(self.segs.len().saturating_sub(1));
-        if self.segs.get(si + 1).is_some_and(|n| ms >= n.t - WIPE_LEAD) {
+        let mut si = cur.map_or(0, |c| style::segment_of(&self.plan.segs, c)).min(self.plan.segs.len().saturating_sub(1));
+        if self.plan.segs.get(si + 1).is_some_and(|n| ms >= n.t - WIPE_LEAD) {
             si += 1;
         }
-        let st = Style::of(self.segs.get(si).map_or(Look::Neon, |s| s.look));
+        let st = style::style_at(&self.plan.segs, si);
         let mut back: Vec<Inst> = vec![Inst::rect(w * 0.5, h * 0.5, w + 40.0, h + 40.0, 0.0, [0.0, 0.0, 0.0, DIM]).fixed()];
-        backdrop(&mut back, &self.segs, si, ms, w, h);
+        backdrop(&mut back, &self.plan.segs, si, ms, w, h);
+        // 進副歌：鏡頭往前推一下，畫面中間一團強調色的光漫開
+        let into = chorus_in(&self.plan.segs, si, ms);
+        if let Some(q) = into {
+            let a = 0.2 * smooth01(q * 8.0) * (1.0 - q).powi(2);
+            let r = h * (0.25 + 0.6 * ease_out(q));
+            back.push(Inst::disk(w * 0.5, h * 0.5, r, with_a(st.accent(accent), a), (0.0, 0.0)).blur(r * 0.5).fixed());
+        }
         let mut deco: Vec<Inst> = Vec::new();
         let mut body: Vec<Inst> = Vec::new();
+        // 倒影場景：字在水面下的倒影（墊在裝飾與字的底下）
+        let mut refl: Vec<Inst> = Vec::new();
         let mut shake = (0.0f32, 0.0f32);
         let mut flash = 0.0f32;
         let mut zoom_in = 0.0f32;
@@ -406,12 +463,24 @@ impl Pv {
             if ms as f32 > exit_end {
                 continue;
             }
+            // 這句這一刻擺在哪：段落場景管的照場景，其他照換句運鏡（被帶進來、帶出去）
+            let line_scene = self.plan.track(i).map_or(Scene::Plain, |t| t.scene);
+            let (pose, dim, haze) = match self.plan.shown(i, ms) {
+                Some(s) => (s.pose, s.alpha, s.blur),
+                None => {
+                    let lift = self.plan.track(i).map_or(cam::Pose::ID, |t| t.lift());
+                    (lift.mul(view.of(&self.plan.steps, i)), 1.0, 0.0)
+                }
+            };
+            if dim <= 0.003 {
+                continue;
+            }
             // 整句的退場進度（裝飾用）
             let out_p = ((ms - exit_t) as f32 / EXIT_MS).clamp(0.0, 1.0);
             let first = line.lay.glyphs.iter().map(|p| p.t).min().unwrap_or(line.t0);
             let in_p = ((ms - (first - LEAD)) as f32 / 400.0).clamp(0.0, 1.0);
-            // 這句唱到一半鏡頭慢慢推近
-            if ms >= line.t0 && ms < exit_t {
+            // 這句唱到一半鏡頭慢慢推近（留在牆上、畫布上的舊句不算）
+            if ms >= line.t0 && ms < exit_t.min(line.next) {
                 zoom_in = zoom_in.max(((ms - line.t0) as f32 / (exit_t - line.t0).max(1) as f32).clamp(0.0, 1.0));
                 tilt = line.lay.tilt;
             }
@@ -421,16 +490,19 @@ impl Pv {
                 .then(|| line.lay.glyphs.iter().enumerate().filter(|(_, p)| p.enter == Enter::Stamp).min_by_key(|(_, p)| p.t).map(|(o, _)| o))
                 .flatten();
             let ls = &line.st;
-            draw_decos(&mut deco, &mut self.atlas, gpu, text, line, ms, in_p, out_p, accent, &beat, w, h, k);
+            // 封面強調色跟著這句所在那段的配色轉
+            let la = ls.accent(accent);
+            let (d0, b0) = (deco.len(), body.len());
+            draw_decos(&mut deco, &mut self.atlas, gpu, text, line, ms, in_p, out_p, la, &beat, w, h, k);
 
             for (order, p) in line.lay.glyphs.iter().enumerate() {
-                let Some(st) = state(p, &line.lay, ms, exit_t, order, &beat, h, ls) else { continue };
+                let Some(st) = state(p, &line.lay, ms, exit_t, order, &beat, h, ls, line.pace) else { continue };
                 let gi = &line.g[p.i];
                 let Some(gk) = gi.key else { continue };
                 let Some(e) = self.atlas.get(gpu, gk, |kk| text.raster(kk)) else { continue };
                 // 鏡頭震：蓋章落地那一下
                 if p.enter == Enter::Stamp {
-                    let age = ms - (p.t - LEAD + enter_ms(Enter::Stamp) as i64);
+                    let age = ms - (p.t - LEAD + (enter_ms(Enter::Stamp) * line.pace) as i64);
                     if quake == Some(order) && (0..280).contains(&age) {
                         let a = (1.0 - age as f32 / 280.0).powi(2) * 12.0 * ls.shake;
                         let ph = age as f32 * 0.09 + p.jitter * 7.0;
@@ -443,7 +515,7 @@ impl Pv {
                     // 落地的那一圈
                     if (0..320).contains(&age) {
                         let q = age as f32 / 320.0;
-                        let col = if p.key { ls.key_ink.unwrap_or(accent) } else { ls.line };
+                        let col = if p.key { ls.key_ink.unwrap_or(la) } else { ls.line };
                         deco.push(Inst::ring(st.x, st.y, p.size * (0.45 + 0.9 * ease_out(q)), 3.0 * (1.0 - q) + 0.5, with_a(col, 0.55 * (1.0 - q) * st.alpha)));
                     }
                 }
@@ -451,7 +523,7 @@ impl Pv {
                 if p.key && ls.sparks && p.enter != Enter::Stamp && ms >= p.t && ms < exit_t {
                     let q = (ms - p.t) as f32 / SPARK_MS;
                     if q < 1.0 {
-                        let col = mix(ls.key_ink.unwrap_or(accent), [1.0; 4], 0.45);
+                        let col = mix(ls.key_ink.unwrap_or(la), [1.0; 4], 0.45);
                         let sd = seed_of(p.jitter);
                         for j in 0..7u64 {
                             let ang = (j as f32 + noise(sd, j) * 0.7) / 7.0 * 2.0 * PI;
@@ -462,7 +534,7 @@ impl Pv {
                         }
                     }
                 }
-                let (fill, line_c, line_w, fill_a) = colors(p, ls, accent, st.sing);
+                let (fill, line_c, line_w, fill_a) = colors(p, ls, la, st.sing);
                 let mut push = |dx: f32, dy: f32, a: f32, col: [f32; 4], lc: [f32; 3], lw: f32, fa: f32, glow: (f32, f32)| {
                     let mut g = glyph_inst(&e, gi.adv, st.x + dx, st.y + dy, p.size * st.scale, st.rot, st.skew, with_a(col, a), lc, lw, fa, glow, k);
                     g.ex = [st.blur, 0.0, 0.0, st.reveal];
@@ -499,6 +571,25 @@ impl Pv {
                 };
                 let glow = if gl > 0.0 { (p.size * if ls.tube { 0.09 } else { 0.06 }, gl) } else { (0.0, 0.0) };
                 push(0.0, 0.0, st.alpha, fill, line_c, line_w, fill_a, glow);
+                // 殘響場景：關鍵字唱到後，三層空心的字從句子中心往外擴、淡掉、失焦（像聲波）
+                if line_scene == Scene::Echo && p.key && ms >= p.t {
+                    let age = (ms - p.t) as f32;
+                    let col = mix(ls.key_ink.unwrap_or(la), ls.ink, 0.35);
+                    for m in 0..3 {
+                        let u = (age - m as f32 * 170.0) / ECHO_MS;
+                        if !(0.0..1.0).contains(&u) {
+                            continue;
+                        }
+                        let f = 1.0 + 0.55 * ease_out(u);
+                        let (ex, ey) = (line.lay.cx + (st.x - line.lay.cx) * f, line.lay.cy + (st.y - line.lay.cy) * f);
+                        let size = p.size * st.scale * (1.0 + 0.3 * ease_out(u));
+                        let a = 0.32 * (1.0 - u).powi(2) * st.alpha;
+                        let lw = (p.size * 0.03).max(1.5);
+                        let mut g = glyph_inst(&e, gi.adv, ex, ey, size, st.rot, st.skew, with_a(col, a), [col[0], col[1], col[2]], lw, 0.0, (0.0, 0.0), k);
+                        g.ex[0] = u * 4.0;
+                        deco.push(g);
+                    }
+                }
                 // 光澤：關鍵字唱到之後，一道亮帶從左上掃到右下（只有本體，殘影與色差不掃）
                 if p.key && ls.shine > 0.0 && ms >= p.t + 60 {
                     let q = (ms - p.t - 60) as f32 / SHINE_MS;
@@ -510,12 +601,23 @@ impl Pv {
                     }
                 }
             }
+            if pose != cam::Pose::ID || dim < 1.0 || haze > 0.0 {
+                for x in deco[d0..].iter_mut().chain(body[b0..].iter_mut()) {
+                    place(x, pose, center);
+                    x.color[3] *= dim;
+                    x.ex[0] += haze;
+                }
+            }
+            if line_scene == Scene::Mirror {
+                reflect(&mut refl, &body[b0..], h * scene::WATER, ms, &beat, h);
+            }
         }
 
-        // 鼓點：一圈從畫面中心擴散出去、閃一下
-        if beat.hit > 0.02 && st.ring {
-            let q = 1.0 - beat.hit;
-            deco.push(Inst::ring(w * 0.5, h * 0.5, h * (0.18 + 0.55 * ease_out(q)), 2.0 + 4.0 * beat.hit, with_a(accent, 0.28 * beat.hit)));
+        // 鼓點：一圈從畫面中心擴散出去、閃一下（主歌不出，越到副歌越明顯）
+        let ring_a = smooth01((heat - 0.3) / 0.35);
+        if raw.hit > 0.02 && st.ring && ring_a > 0.0 {
+            let q = 1.0 - raw.hit;
+            deco.push(Inst::ring(w * 0.5, h * 0.5, h * (0.18 + 0.55 * ease_out(q)), 2.0 + 4.0 * raw.hit, with_a(st.accent(accent), 0.28 * raw.hit * ring_a)));
         }
         flash = flash.max(0.05 * st.flash * beat.hit * beat.hit);
         // 前奏、間奏、尾奏沒有字的時候鋪一層流光：上一句退完才淡進，下一句的字出來前淡掉
@@ -540,27 +642,37 @@ impl Pv {
             let from = back.len();
             scenery(&mut back, st, ms, &beat, w, h);
             if lines_on {
-                ambient(&mut back, st, ms, &beat, accent, w, h);
+                ambient(&mut back, st, ms, &beat, st.accent(accent), w, h);
             }
-            flow(&mut back, st, ms, &beat, accent, idle, w, h);
+            flow(&mut back, st, ms, &beat, st.accent(accent), idle, w, h);
             for x in &mut back[from..] {
                 x.color[3] *= k;
             }
         };
-        match wipe_at(&self.segs, si, ms, w) {
+        match wipe_at(&self.plan.segs, si, ms, w) {
             Some(wp) => {
-                fade(&Style::of(self.segs[si - 1].look), 1.0 - wp.q);
+                fade(&style::style_at(&self.plan.segs, si - 1), 1.0 - wp.q);
                 fade(&st, wp.q);
             }
             None => fade(&st, 1.0),
         }
+        // 段落場景的背景（光塵、縱深的框、跑馬燈帶）：換段時自己交叉淡化，同一個風格不刷色的時候也不會硬切
+        let sq = self.plan.segs.get(si).map_or(1.0, |s| smooth01((ms - (s.t - WIPE_LEAD)) as f32 / WIPE_MS));
+        for (j, kq) in [(si.checked_sub(1), 1.0 - sq), (Some(si), sq)] {
+            if let Some(j) = j
+                && let Some(tr) = self.plan.tracks.get(j)
+            {
+                scene::back(&mut back, &mut self.atlas, gpu, text, tr, &self.plan.segs, j, &self.lines, kq, ms, &beat, accent, k);
+            }
+        }
         let mut all = back;
+        all.extend(refl);
         all.extend(deco);
         all.extend(body);
         // 暗角與底片顆粒蓋在最上面（字也一起），換段時一樣交叉淡化
-        match wipe_at(&self.segs, si, ms, w) {
+        match wipe_at(&self.plan.segs, si, ms, w) {
             Some(wp) => {
-                screen(&mut all, &Style::of(self.segs[si - 1].look), ms, &beat, 1.0 - wp.q, w, h);
+                screen(&mut all, &style::style_at(&self.plan.segs, si - 1), ms, &beat, 1.0 - wp.q, w, h);
                 screen(&mut all, &st, ms, &beat, wp.q, w, h);
             }
             None => screen(&mut all, &st, ms, &beat, 1.0, w, h),
@@ -568,7 +680,7 @@ impl Pv {
         if flash > 0.003 {
             all.push(Inst::rect(w * 0.5, h * 0.5, w + 40.0, h + 40.0, 0.0, [1.0, 1.0, 1.0, flash]).fixed());
         }
-        wipe(&mut all, &self.segs, si, ms, accent, w, h);
+        wipe(&mut all, &self.plan.segs, si, ms, st.accent(accent), w, h);
         if inp.alpha < 1.0 {
             for x in &mut all {
                 x.color[3] *= inp.alpha;
@@ -578,16 +690,17 @@ impl Pv {
         // 鏡頭
         let room = 1.0 - (inp.inset / w).clamp(0.0, 0.6) * 0.6;
         let mix = inp.mix.clamp(0.0, 1.0);
-        let zoom = (1.0 + (0.025 * beat.env + 0.04 * beat.hit) * st.pump + 0.035 * ease_in_out(zoom_in))
+        let punch = into.map_or(0.0, |q| smooth01(q * 9.0) * (1.0 - smooth01(q)));
+        let zoom = (1.0 + (0.025 * beat.env + 0.04 * beat.hit) * st.pump + 0.035 * amp * ease_in_out(zoom_in) + 0.04 * punch)
             * room
             * (1.0 + MIX_ZOOM * (1.0 - mix));
         let drift = ms as f32 / 1000.0;
         // 唱下去鏡頭慢慢轉正一點（斜的那句會被「扶起來」）
         // 鼓點只推鏡頭（上面的 zoom），不抖
-        let cam_rot = 0.012 * (drift * 0.37).sin() - tilt * 0.25 * ease_in_out(zoom_in);
+        let cam_rot = 0.012 * amp * (drift * 0.37).sin() - tilt * 0.25 * ease_in_out(zoom_in);
         let off = (
-            inp.inset * 0.5 + shake.0 + 7.0 * (drift * 0.23).sin(),
-            shake.1 + 5.0 * (drift * 0.31).cos(),
+            inp.inset * 0.5 + shake.0 + 7.0 * amp * (drift * 0.23).sin(),
+            shake.1 + 5.0 * amp * (drift * 0.31).cos(),
         );
         // 進出一般歌詞頁的遮罩：0 的時候邊界在畫面右邊外面，1 的時候在左邊外面
         let (edge, soft) = if mix < 1.0 {
@@ -625,6 +738,11 @@ struct Beat {
 }
 
 impl Beat {
+    /// 強度放大縮小（不超過 1）
+    fn scaled(self, k: f32) -> Self {
+        Self { env: (self.env * k).min(1.0), hit: (self.hit * k).min(1.0) }
+    }
+
     fn at(p: &beat::Pulse, now: Instant) -> Self {
         let env = p.since_beat(now).map_or(0.0, |s| (-s / 0.11).exp() * p.conf.min(1.0));
         let hit = match p.hit_at {
@@ -665,6 +783,61 @@ fn enter_ms(e: Enter) -> f32 {
         Enter::Type => 90.0,
         Enter::Ignite => 560.0,
         Enter::Focus => 650.0,
+        Enter::Spring => 640.0,
+        Enter::Whip(_) => 520.0,
+    }
+}
+
+/// 這句的進場動作要多快：字與字平均隔 220 ms 是原本的長度，唱得越快收得越短
+fn pace_of(lay: &Layout) -> f32 {
+    let mut ts: Vec<i64> = lay.glyphs.iter().map(|p| p.t).collect();
+    ts.sort_unstable();
+    let mut gaps: Vec<i64> = ts.windows(2).map(|w| w[1] - w[0]).filter(|&g| g > 0).collect();
+    if gaps.is_empty() {
+        return 1.0;
+    }
+    gaps.sort_unstable();
+    (gaps[gaps.len() / 2] as f32 / 220.0).clamp(0.7, 1.25)
+}
+
+/// 把一句的東西整組搬到鏡頭裡它該在的地方：位置、角度、大小，連描邊、光暈、失焦一起縮放
+fn place(x: &mut Inst, p: cam::Pose, c: (f32, f32)) {
+    let (nx, ny) = p.map(x.pos[0], x.pos[1], c);
+    x.pos = [nx, ny, x.pos[2] * p.s, x.pos[3] * p.s];
+    x.xf[0] += p.a;
+    x.fx[0] *= p.s;
+    x.ex[0] *= p.s;
+    let shape = x.xf[3];
+    if shape < 0.5 {
+        x.xf[2] *= p.s;
+    }
+    if shape < 4.5 {
+        x.line[3] *= p.s;
+    } else if shape > 7.5 {
+        x.line[0] *= p.s;
+        x.line[2] *= p.s;
+    }
+}
+
+/// 倒影：水面以上的字翻到水面下，壓扁一點、淡、糊，跟著水波左右晃。
+/// 翻轉是把圖集的上下對調（`uv` 的 v0、v1），旋轉與傾斜跟著反過來
+fn reflect(out: &mut Vec<Inst>, body: &[Inst], wy: f32, ms: i64, beat: &Beat, h: f32) {
+    for g in body.iter().filter(|g| g.xf[3] < 0.5 && g.pos[1] < wy) {
+        let d = wy - g.pos[1];
+        let a = 0.3 * (1.0 - smooth01(d / (h * 0.55)));
+        if g.color[3] * a <= 0.003 {
+            continue;
+        }
+        let mut r = *g;
+        r.pos[0] += (ms as f32 / 260.0 + d * 0.045).sin() * (2.5 + 3.5 * beat.env);
+        r.pos[1] = wy + d * 0.8;
+        r.pos[3] *= 0.8;
+        r.uv = [g.uv[0], g.uv[3], g.uv[2], g.uv[1]];
+        r.xf[0] = -g.xf[0];
+        r.xf[1] = -g.xf[1];
+        r.color[3] *= a;
+        r.ex = [g.ex[0] + 2.5 + d * 0.012, 0.0, 0.0, 0.0];
+        out.push(r);
     }
 }
 
@@ -704,18 +877,34 @@ fn enter_at(p: &Placed, q: f32) -> (f32, f32, f32, f32, f32, f32) {
             (0.0, 0.0, 1.0, 0.0, 0.0, if on { 0.35 + 0.65 * q.sqrt() } else { 0.15 })
         }
         Enter::Focus => (0.0, 0.0, 1.0 + 0.05 * (1.0 - ease_out(q)), 0.0, 0.0, ease_out(q)),
+        Enter::Spring => {
+            if q >= 1.0 {
+                return (0.0, 0.0, 1.0, 0.0, 0.0, 1.0);
+            }
+            // 彈簧：彈出來衝過頭，來回晃兩三下才停（比 Pop 多晃、收得軟）
+            let wob = (-4.0 * q).exp() * (1.0 - q);
+            let x = 1.0 - wob * (13.0 * q).cos();
+            (0.0, 0.0, x.max(0.0), wob * (13.0 * q).sin() * 0.3 * p.jitter, 0.0, (q * 5.0).min(1.0))
+        }
+        Enter::Whip(dir) => {
+            // 預備動作：先往外退一點蓄力，再甩進來、衝過頭一點才停；甩的時候順著方向拉斜
+            let e = back_in_out(q);
+            let v = (back_in_out((q + 0.02).min(1.0)) - e) / 0.02;
+            (dir * (1.0 - e) * s * 2.6, 0.0, 1.0, 0.0, -dir * (v * 0.2).clamp(-0.25, 0.7), (q * 4.0).min(1.0))
+        }
     }
 }
 
 /// 這句什麼時候開始退場：唱完待一陣子，或下一句來了。
 /// 倒退鍵要在下一句打第一個字之前刪完，不然新舊兩句會疊在一起
 fn exit_time(line: &Line) -> i64 {
-    let t = line.next.min(line.lay.sung_end + LINGER);
+    // 段落場景要留著的，跟整段一起退
+    let (t, next) = line.until.unwrap_or((line.next.min(line.lay.sung_end + LINGER), line.next));
     if line.lay.exit != Exit::Erase {
         return t;
     }
     let total = erase_at(line.lay.glyphs.len(), 0, 0) as i64 + 40;
-    t.min(line.next - LEAD - total).max(line.lay.sung_end)
+    t.min(next - LEAD - total).max(line.lay.sung_end)
 }
 
 /// 倒退鍵刪到第 `order` 個字的時間：從最後一個字往回刪，整句刪完不超過一般退場的長度
@@ -725,12 +914,12 @@ fn erase_at(n: usize, order: usize, exit_t: i64) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn state(p: &Placed, lay: &Layout, ms: i64, exit_t: i64, order: usize, beat: &Beat, h: f32, st: &Style) -> Option<State> {
+fn state(p: &Placed, lay: &Layout, ms: i64, exit_t: i64, order: usize, beat: &Beat, h: f32, st: &Style, pace: f32) -> Option<State> {
     let start = p.t - LEAD;
     if ms < start {
         return None;
     }
-    let dur = enter_ms(p.enter);
+    let dur = enter_ms(p.enter) * pace;
     let te = (ms - start) as f32;
     let q = (te / dur).clamp(0.0, 1.0);
     let (mut dx, mut dy, mut scale, mut rot, skew, mut alpha) = enter_at(p, q);
@@ -747,7 +936,7 @@ fn state(p: &Placed, lay: &Layout, ms: i64, exit_t: i64, order: usize, beat: &Be
 
     // 殘影：滑進來的時候往回取三個時間點
     let mut trail = Vec::new();
-    if matches!(p.enter, Enter::Slide(_)) && q < 1.0 {
+    if matches!(p.enter, Enter::Slide(_) | Enter::Whip(_)) && q < 1.0 {
         for (j, a) in [(1, 0.35), (2, 0.2), (3, 0.1)] {
             let qq = ((te - 28.0 * j as f32) / dur).clamp(0.0, 1.0);
             if qq > 0.0 {
@@ -1091,7 +1280,7 @@ fn seal(
 
 /// 墊底：這段風格的底色。換段時新的底色從左邊漸漸漫過來，新舊之間是一大段漸層
 fn backdrop(out: &mut Vec<Inst>, segs: &[Segment], si: usize, ms: i64, w: f32, h: f32) {
-    let bg_of = |i: usize| Style::of(segs.get(i).map_or(Look::Neon, |s| s.look)).bg;
+    let bg_of = |i: usize| style::style_at(segs, i).bg;
     let cur = bg_of(si);
     match wipe_at(segs, si, ms, w) {
         Some(wp) => {
@@ -1106,6 +1295,17 @@ fn backdrop(out: &mut Vec<Inst>, segs: &[Segment], si: usize, ms: i64, w: f32, h
         None if cur[3] > 0.0 => out.push(Inst::rect(w * 0.5, h * 0.5, w + 40.0, h + 40.0, 0.0, cur).fixed()),
         None => {}
     }
+}
+
+/// 剛進副歌（前一段不是副歌）：從第一句前一點點開始的進度 0..1，其他時候 `None`
+fn chorus_in(segs: &[Segment], si: usize, ms: i64) -> Option<f32> {
+    const MS: f32 = 1400.0;
+    let s = segs.get(si)?;
+    if !s.chorus || si == 0 || segs[si - 1].chorus {
+        return None;
+    }
+    let q = (ms - (s.t - LEAD * 2)) as f32 / MS;
+    (0.0..1.0).contains(&q).then_some(q)
 }
 
 /// 換段轉場刷到哪
@@ -1124,7 +1324,8 @@ fn wipe_at(segs: &[Segment], si: usize, ms: i64, w: f32) -> Option<Wipe> {
     }
     let s = segs.get(si)?;
     let q = (ms - (s.t - WIPE_LEAD)) as f32 / WIPE_MS;
-    if !(0.0..1.0).contains(&q) || segs[si - 1].look == s.look {
+    // 同一個風格（鎖定時）換了配色也要刷過去，不然顏色會硬切
+    if !(0.0..1.0).contains(&q) || (segs[si - 1].look == s.look && segs[si - 1].hue == s.hue) {
         return None;
     }
     // 斜的，所以兩端要多刷一點；再加上漸層的半寬，開頭結尾才整片是舊的／新的。
@@ -1222,18 +1423,18 @@ fn scenery(out: &mut Vec<Inst>, st: &Style, ms: i64, beat: &Beat, w: f32, h: f32
     if st.halftone {
         // 普普：右上、左下兩片網點，點陣慢慢斜著平移，拍點時點大一點
         let fill = 0.85 * (1.0 + 0.12 * beat.env);
-        out.push(Inst::dots(w, 0.0, h * 0.95, 18.0, fill, t * 8.0, [1.0, 0.42, 0.15, 0.5]));
-        out.push(Inst::dots(0.0, h, h * 0.75, 14.0, fill, -t * 6.0, [1.0, 0.98, 0.92, 0.55]));
+        out.push(Inst::dots(w, 0.0, h * 0.95, 18.0, fill, t * 8.0, st.spin([1.0, 0.42, 0.15, 0.5])));
+        out.push(Inst::dots(0.0, h, h * 0.75, 14.0, fill, -t * 6.0, st.spin([1.0, 0.98, 0.92, 0.55])));
     }
     if st.grid {
         // 復古：地平線以下是往鏡頭流過來的透視網格，地平線上一道粉紅的光
         let y0 = h * 0.66;
-        let pink = [1.0, 0.3, 0.75, 1.0];
+        let pink = st.spin([1.0, 0.3, 0.75, 1.0]);
         let big = w.max(h) * 3.0;
         // 天空：往地平線漸漸透出粉紫
-        out.push(Inst::grad(w * 0.5, y0 - h * 0.25, big, PI * 0.5, [0.3, 0.05, 0.4, 0.0], [0.6, 0.12, 0.5, 0.45], h * 0.3).fixed());
+        out.push(Inst::grad(w * 0.5, y0 - h * 0.25, big, PI * 0.5, st.spin([0.3, 0.05, 0.4, 0.0]), st.spin([0.6, 0.12, 0.5, 0.45]), h * 0.3).fixed());
         // 地面壓暗
-        out.push(Inst::rect(w * 0.5, (y0 + h) * 0.5 + 10.0, w + 40.0, h - y0 + 20.0, 0.0, [0.04, 0.0, 0.08, 0.8]).fixed());
+        out.push(Inst::rect(w * 0.5, (y0 + h) * 0.5 + 10.0, w + 40.0, h - y0 + 20.0, 0.0, st.spin([0.04, 0.0, 0.08, 0.8])).fixed());
         out.push(Inst::bar(w * 0.5, y0, w * 1.6, h * 0.05, 0.0, with_a(pink, 0.5 + 0.15 * beat.env), 0.0).fixed());
         // 橫線：越近間距越大，慢慢往下流；靠地平線的淡掉
         let n = 11;
@@ -1269,6 +1470,7 @@ fn scenery(out: &mut Vec<Inst>, st: &Style, ms: i64, beat: &Beat, w: f32, h: f32
             let r = h * r * (1.0 + 0.08 * breathe);
             let x = x * w + (t * 0.05 + noise(j, 63) * 6.3).sin() * w * 0.03;
             let a = 0.07 + 0.11 * breathe;
+            let c = st.spin3(c);
             out.push(Inst::disk(x, y * h, r, [c[0], c[1], c[2], a], (0.0, 0.0)).blur(r * 0.6).fixed());
         }
     }
@@ -1373,7 +1575,7 @@ fn glyphs(text: &mut Text, l: &crate::lyrics::Line, next: i64) -> Vec<GIn> {
 }
 
 /// 原句每個字（char）開始唱的時間與長度。有逐字照逐字；沒有就把這句平均分給每個字
-fn char_times(l: &crate::lyrics::Line, next: i64) -> Vec<(i64, i64)> {
+pub(super) fn char_times(l: &crate::lyrics::Line, next: i64) -> Vec<(i64, i64)> {
     let chars: Vec<char> = l.text.chars().collect();
     let n = chars.len();
     // 逐字：把每個字詞的時間平均分給它裡面的字，跳過空白後依序對上原句
@@ -1464,6 +1666,15 @@ fn expo_out(t: f32) -> f32 {
 fn back_out(t: f32, s: f32) -> f32 {
     let u = t - 1.0;
     1.0 + (s + 1.0) * u * u * u + s * u * u
+}
+/// 先往反方向退一點、最後衝過頭一點（預備動作）
+fn back_in_out(t: f32) -> f32 {
+    let c = 1.70158 * 1.525;
+    if t < 0.5 {
+        (2.0 * t).powi(2) * ((c + 1.0) * 2.0 * t - c) * 0.5
+    } else {
+        ((2.0 * t - 2.0).powi(2) * ((c + 1.0) * (2.0 * t - 2.0) + c) + 2.0) * 0.5
+    }
 }
 fn bounce_out(t: f32) -> f32 {
     let (n, d) = (7.5625, 2.75);

@@ -254,7 +254,7 @@ pub fn render(
     // ---- 1+2：中央封面鋪滿 → 模糊，當背景 ----
     // quads 一幀只 begin 一次，中間各趟只 flush。資料統一在最後 upload。
     quads.begin(gpu);
-    let bg_src = Offscreen::new(&gpu.device, w, h);
+    let bg_src = glass.backdrop_src(gpu, 0, w, h);
     {
         // 換圖時上一張墊底，新的那張淡進來（CSS `background-image .7s`）
         let k = match fx.bg_prev {

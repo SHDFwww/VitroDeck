@@ -231,7 +231,7 @@ impl Matcher {
 ///    名稱，只有 `artist:` 這個欄位過濾器不認 —— 實測「七里香 周杰倫」第一筆
 ///    就是 Jay Chou 的那張，而只用 `album:"七里香"` 會挑到同名的翻唱版。
 ///
-/// 兩段都只認「專輯名完全相同」的結果，避免把『超級右腦』當成『右腦』。
+/// 兩段都優先挑「專輯名完全相同」的結果，避免把『超級右腦』當成『右腦』；第二段只認同名的。
 fn search_album(
     sp: &mut Spotify,
     album_name: &str,
@@ -239,17 +239,18 @@ fn search_album(
 ) -> Result<Option<serde_json::Value>, ApiError> {
     let key = norm_name(album_name);
 
+    // `album:` 過濾器是模糊比對，第一名可能是「X (Deluxe)」這種別的版本，所以多要幾筆（同樣一次請求），
+    // 有同名的先挑同名的；都不同名才照舊用第一名（兩個過濾器都對上了，多半是名稱在地化的差別）
     let q = format!("album:\"{album_name}\" artist:\"{artist}\"");
     let data = sp.get(
         "/search",
-        &[("q", q), ("type", "album".into()), ("limit", "1".into())],
+        &[("q", q), ("type", "album".into()), ("limit", "5".into())],
     )?;
-    if let Some(first) = data
-        .as_ref()
-        .and_then(|d| d["albums"]["items"].as_array())
-        .and_then(|v| v.first())
+    if let Some(items) = data.as_ref().and_then(|d| d["albums"]["items"].as_array())
+        && let Some(hit) =
+            items.iter().find(|it| norm_name(it["name"].as_str().unwrap_or("")) == key).or(items.first())
     {
-        return Ok(Some(first.clone()));
+        return Ok(Some(hit.clone()));
     }
 
     if artist.is_empty() {

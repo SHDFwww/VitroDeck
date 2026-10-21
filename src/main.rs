@@ -9,6 +9,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod albums;
+mod align;
+mod alignrec;
 mod anim;
 mod art;
 mod audio;
@@ -21,6 +23,7 @@ mod gfx;
 mod icons;
 mod instance;
 mod layered;
+mod lead;
 mod ledfeed;
 mod glass;
 mod lyrics;
@@ -2896,6 +2899,7 @@ impl App {
             settings::Item::FontScale => self.sync_font(),
             // 曲名、清單這些下一幀就換；已經抓回來的歌詞要等下一首才照新設定
             settings::Item::LyricsTraditional => zh::set_enabled(self.cfg.lyrics_traditional),
+            settings::Item::LyricsAutoalign => self.sync_autoalign(),
             // 拖曳中先不套：設定視窗會跟著縮放，滑桿就在游標底下跑掉。放開時（`DragEnd`）才套
             settings::Item::UiScale
                 if self.prefs.as_ref().and_then(|p| p.dragging()) != Some(settings::Item::UiScale) =>
@@ -2912,6 +2916,20 @@ impl App {
             _ => {}
         }
         self.save_cfg();
+    }
+
+    /// 自動對齊的開關不用重開程式：正在播的這首馬上套用或拿掉量過的偏移
+    fn sync_autoalign(&mut self) {
+        let on = self.cfg.lyrics_autoalign;
+        let id = self.now_flag(|n| n.id.clone());
+        let mut g = self.player.shared.lyrics.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_mut().filter(|l| l.source != "loading" && !id.is_empty()) {
+            Some(l) => {
+                crate::align::set_enabled(on, Some((&id, l)));
+                l.auto_ms = crate::align::auto_shift(&self.paths.lyrics, &id, l);
+            }
+            None => crate::align::set_enabled(on, None),
+        }
     }
 
     /// 從「正在播的那首」讀一個欄位。沒有在播就給預設值。
@@ -2954,19 +2972,23 @@ impl App {
         let per_track = id.filter(|i| !i.is_empty()).and_then(|id| {
             let mut g = self.player.shared.lyrics.lock().ok()?;
             let l = g.as_mut().filter(|l| l.source != "loading")?;
-            // d 是「相對現在」的增量；0 鍵傳進來的是 i64::MIN，代表歸零
-            l.offset_ms = if d == i64::MIN { 0 } else { (l.offset_ms + d).clamp(-3000, 3000) };
+            // d 是「相對現在」的增量；0 鍵傳進來的是 i64::MIN，代表歸零（回到自動對齊的值）。
+            // 從現在實際用的偏移起算，自動對齊修過的歌不會一按就跳回 0
+            l.offset_ms = if d == i64::MIN { 0 } else { (l.track_shift() + d).clamp(-3000, 3000) };
             lyrics::set_track_offset(&self.paths.lyrics, &id, l.offset_ms);
-            Some(l.offset_ms)
+            Some((l.track_shift(), l.offset_ms == 0 && l.auto_ms != 0))
         });
+        let per_track_ms = per_track.map(|(ms, _)| ms);
         match per_track {
-            Some(ms) => self.toast(format!("這首歌詞時間 {ms:+}ms（全域 {:+}ms）", self.cfg.lyrics_offset_ms)),
+            Some((ms, true)) => self.toast(format!("這首歌詞時間 {ms:+}ms（自動對齊；全域 {:+}ms）", self.cfg.lyrics_offset_ms)),
+            Some((ms, false)) => self.toast(format!("這首歌詞時間 {ms:+}ms（全域 {:+}ms）", self.cfg.lyrics_offset_ms)),
             None => {
                 self.cfg.lyrics_offset_ms = if d == i64::MIN { 0 } else { (self.cfg.lyrics_offset_ms + d).clamp(-3000, 3000) };
                 self.save_cfg();
                 self.toast(format!("歌詞時間 {:+}ms", self.cfg.lyrics_offset_ms));
             }
         }
+        crate::alignrec::offset(per_track_ms, self.cfg.lyrics_offset_ms);
     }
 
     fn zoom_covers(&mut self, d: f32) {
@@ -4173,7 +4195,12 @@ impl ApplicationHandler<UserEv> for App {
                     let target = Duration::from_secs_f32(cap);
                     let spent = self.last.elapsed();
                     if spent < target {
-                        std::thread::sleep(target - spent);
+                        // 閒置降幀時有輸入就提早醒；使用者設的更新率上限照睡滿
+                        if matches!(pace, Pace::Slow(_)) {
+                            nap_until_input(target - spent);
+                        } else {
+                            std::thread::sleep(target - spent);
+                        }
                     }
                 }
                 // 啟動到第一幀。要量的是「使用者看到東西」的時間，
@@ -4630,6 +4657,27 @@ fn main() -> anyhow::Result<()> {
     }
     el.run_app(&mut app)?;
     Ok(())
+}
+
+/// 閒置降幀時睡到下一格，但有新的鍵盤、滑鼠輸入就提早醒。整段 `sleep` 的話，
+/// 停播降到 10 fps 時滑鼠一動要等這格睡完（最多 100 ms）事件才派得出去
+fn nap_until_input(d: Duration) {
+    use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, QS_INPUT};
+    // 等輸入那段的逾時只到毫秒、計時器解析度可能只有 15.6 ms，所以提早 20 ms 收手，
+    // 剩下的照原本用 sleep 睡，影格間距跟以前一樣
+    const MARGIN: Duration = Duration::from_millis(20);
+    let start = Instant::now();
+    if d > MARGIN * 2 {
+        let ms = (d - MARGIN).as_millis() as u32;
+        // 不帶 MWMO_INPUTAVAILABLE：只有「新來的」輸入才叫醒。沒有要等的物件時回 0 就是有輸入，逾時回 WAIT_TIMEOUT
+        let r = unsafe { MsgWaitForMultipleObjectsEx(None, ms, QS_INPUT, Default::default()) };
+        if r.0 == 0 {
+            return;
+        }
+    }
+    if let Some(left) = d.checked_sub(start.elapsed()) {
+        std::thread::sleep(left);
+    }
 }
 
 /// 接回父行程的主控台。debug 版本來就是主控台程式，呼叫了也沒事（已經有就會失敗，忽略）。

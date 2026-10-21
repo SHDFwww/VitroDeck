@@ -274,7 +274,7 @@ pub fn render_with(
     quads.begin(gpu);
 
     // ---- 背景：封面鋪滿 → 模糊 ----
-    let bg_src = Offscreen::new(&gpu.device, w, h);
+    let bg_src = glass.backdrop_src(gpu, 1, w, h);
     {
         // 換歌時上一張墊底，新的那張淡進來
         let k = match now.bg_prev {
@@ -405,7 +405,7 @@ pub fn render_with(
     if let Some(p) = pv_debug {
         text.set_fx(1.0, 0.0);
         let bpm = if p.period > 0.0 { 60.0 / p.period } else { 0.0 };
-        let s = format!("BPM {bpm:.1}　信心 {:.2}　鼓點 {:.2}", p.conf, p.hit);
+        let s = format!("BPM {bpm:.1}　信心 {:.2}　鼓點 {:.2}　響度 {:.2}（可信 {:.2}）", p.conf, p.hit, p.energy, p.energy_conf);
         let (tw, _) = text.measure(&s, 12.0, 16.0, None);
         text.push(&s, fw - tw - 16.0, fh - 28.0, 12.0, 16.0, theme::ink(0.7), 400, None, None);
         text.set_fx(left_a, left_dy);

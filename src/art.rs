@@ -1,7 +1,7 @@
 //! 封面圖的快取與非同步載入。
 //!
-//! 下載在背景執行緒做，上傳 GPU 一定要回到算圖執行緒 —— 所以中間用 channel
-//! 傳位元組，每幀 `pump()` 一次把到貨的做成材質。
+//! 下載與解碼在背景執行緒做，上傳 GPU 一定要回到算圖執行緒 —— 所以中間用 channel
+//! 傳解好的像素，每幀 `pump()` 一次把到貨的做成材質。
 //!
 //! 磁碟快取放在 `cache/art/`，檔名是網址的雜湊。Spotify 的圖網址是穩定的，
 //! 所以存下來之後重開就不用再下載。
@@ -19,7 +19,7 @@ pub struct ArtCache {
     map: HashMap<String, Arc<wgpu::TextureView>>,
     inflight: HashSet<String>,
     req_tx: Sender<(String, PathBuf)>,
-    done_rx: Receiver<(String, Vec<u8>)>,
+    done_rx: Receiver<(String, Decoded)>,
     dir: PathBuf,
     /// 載入中先拿這張頂著，版面才不會跳。
     pub placeholder: Arc<wgpu::TextureView>,
@@ -100,16 +100,16 @@ impl ArtCache {
     /// 每幀呼叫一次，把下載好的做成材質。回傳這一幀新到了幾張。
     pub fn pump(&mut self, gpu: &Gpu) -> usize {
         let mut n = 0;
-        while let Ok((url, bytes)) = self.done_rx.try_recv() {
+        while let Ok((url, img)) = self.done_rx.try_recv() {
             self.inflight.remove(&url);
-            if bytes.is_empty() {
-                continue;
-            }
-            match crate::gfx::upload_encoded(gpu, &bytes, "album-art") {
-                Ok(t) => {
-                    self.map.insert(url, t);
+            match img {
+                Ok(img) => {
+                    let (w, h) = img.dimensions();
+                    self.map.insert(url, crate::gfx::upload_rgba(gpu, w, h, &img, "album-art"));
                     n += 1;
                 }
+                // 沒抓到（空的）不用記
+                Err(e) if e.is_empty() => {}
                 Err(e) => crate::warn!("封面解碼失敗：{e}"),
             }
         }
@@ -117,7 +117,19 @@ impl ArtCache {
     }
 }
 
-fn worker(req_rx: Receiver<(String, PathBuf)>, done_tx: Sender<(String, Vec<u8>)>) {
+/// 背景執行緒解好的圖：RGBA 像素，或沒抓到（空的）、解不開（錯誤訊息）
+type Decoded = Result<image::RgbaImage, String>;
+
+/// 解碼留在背景執行緒：640px 的 JPEG 一張要幾毫秒，剛啟動整排封面同一幀到貨時，
+/// 在算圖執行緒解會卡住那一幀
+fn decode(bytes: &[u8]) -> Decoded {
+    if bytes.is_empty() {
+        return Err(String::new());
+    }
+    image::load_from_memory(bytes).map(|i| i.to_rgba8()).map_err(|e| e.to_string())
+}
+
+fn worker(req_rx: Receiver<(String, PathBuf)>, done_tx: Sender<(String, Decoded)>) {
     let http = reqwest::blocking::Client::builder()
         .user_agent(crate::config::user_agent())
         .timeout(std::time::Duration::from_secs(20))
@@ -127,7 +139,7 @@ fn worker(req_rx: Receiver<(String, PathBuf)>, done_tx: Sender<(String, Vec<u8>)
     while let Ok((url, path)) = req_rx.recv() {
         // 先看磁碟。Spotify 的圖網址是穩定的，存過就不必再下載。
         if let Ok(bytes) = std::fs::read(&path) {
-            let _ = done_tx.send((url, bytes));
+            let _ = done_tx.send((url, decode(&bytes)));
             continue;
         }
         let bytes = http
@@ -140,7 +152,7 @@ fn worker(req_rx: Receiver<(String, PathBuf)>, done_tx: Sender<(String, Vec<u8>)
         if !bytes.is_empty() {
             let _ = std::fs::write(&path, &bytes);
         }
-        if done_tx.send((url, bytes)).is_err() {
+        if done_tx.send((url, decode(&bytes))).is_err() {
             return; // 主程式收掉了
         }
     }

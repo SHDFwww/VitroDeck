@@ -92,7 +92,17 @@ pub fn set_pv(on: bool) {
 }
 
 fn needed() -> bool {
-    VIZ.load(Ordering::Relaxed) || PV.load(Ordering::Relaxed) || crate::ledfeed::wanted()
+    VIZ.load(Ordering::Relaxed)
+        || PV.load(Ordering::Relaxed)
+        || crate::ledfeed::wanted()
+        || crate::alignrec::on()
+        || crate::align::wants_audio()
+}
+
+/// 歌詞對齊（含 `VITRO_ALIGN_REC`）要的擷取方式：大緩衝、每次醒來讀到空。
+/// 對齊關著時照原本的小緩衝、一次讀一個封包，跟沒有這個功能時一樣
+fn wide() -> bool {
+    crate::align::enabled() || crate::alignrec::on()
 }
 
 pub fn start() -> Shared {
@@ -130,12 +140,18 @@ fn capture_once(out: &Shared) -> anyhow::Result<()> {
     let fmt = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, 2, None);
     let blockalign = fmt.get_blockalign() as usize;
     let (_def, min_time) = client.get_device_period()?;
+    let big = wide();
 
     // Render 裝置 + Direction::Capture == loopback。Exclusive 不支援 loopback。
     client.initialize_client(
         &fmt,
         &Direction::Capture,
-        &StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: min_time },
+        // 對齊時緩衝至少 100 ms：視窗藏起來、程式閒置時這條執行緒會晚醒（實測一次晚到兩個封包），
+        // 用最小週期（約 10 ms）當緩衝的話每 30 ms 就溢位一次、掉 8 ms 的聲音
+        &StreamMode::EventsShared {
+            autoconvert: true,
+            buffer_duration_hns: if big { min_time.max(1_000_000) } else { min_time },
+        },
     )?;
 
     let h_event = client.set_get_eventhandle()?;
@@ -162,14 +178,34 @@ fn capture_once(out: &Shared) -> anyhow::Result<()> {
     // 節拍：每 HOP 個新取樣餵一次頻譜
     let mut tracker = crate::pv::beat::Tracker::default();
     let mut hop = 0usize;
+    // `VITRO_ALIGN_REC`：歌詞對齊的資料收集，沒設就什麼都不做
+    let mut rec = crate::alignrec::Rec::default();
 
     loop {
-        // 沒人要了就收掉，回到外面等
-        if !needed() {
+        // 沒人要了就收掉，回到外面等；對齊剛開關的話也收掉，外面照新的方式重開
+        if !needed() || wide() != big {
             let _ = client.stop_stream();
             return Ok(());
         }
-        capture.read_from_device_to_deque(&mut raw)?;
+        // 一次 GetBuffer 只拿一個封包。醒得晚時佇列裡會有好幾個，只讀一個的話剩下的
+        // 要等下一次事件，積著積著就溢位 —— 對齊時每次醒來都讀到空為止
+        loop {
+            let before = raw.len();
+            let info = capture.read_from_device_to_deque(&mut raw)?;
+            if raw.len() == before {
+                break;
+            }
+            if crate::alignrec::on() {
+                let fl = &info.flags;
+                rec.push(raw.range(before..).copied(), info.timestamp, info.index, fl.silent, fl.data_discontinuity);
+            }
+            if crate::align::wants_audio() {
+                crate::align::audio(info.timestamp, raw.range(before..).copied(), info.flags.silent);
+            }
+            if !big || capture.get_next_packet_size()?.unwrap_or(0) == 0 {
+                break;
+            }
+        }
 
         // 一次讀完手上所有的立體聲 frame，混成單聲道推進滑動視窗。
         let mut got = false;

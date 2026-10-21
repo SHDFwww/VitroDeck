@@ -70,6 +70,8 @@ pub struct NowPlaying {
     pub device: String,
     pub shuffle: bool,
     pub repeat: Repeat,
+    /// Spotify 給 SMTC 的原始時間軸（見 `smtc::Track::stamp`），web 來源沒有
+    pub smtc_stamp: Option<(i64, i64, i64)>,
     /// 讀到這筆狀態的本機時刻，畫面端拿它內插播放位置。
     pub at: Instant,
     /// smtc / web
@@ -226,6 +228,8 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let mut sp = Spotify::new(&cfg, paths.tokens.clone());
     let mut matcher = Matcher::load(paths.resolved.clone());
     let lyrics_tx = spawn_lyrics(&cfg, &paths, &shared);
+    // 歌詞自動對齊：配錯歌時要叫歌詞執行緒重抓
+    crate::align::start(&cfg, &paths, shared.clone(), lyrics_tx.clone());
     shared.authed.store(sp.logged_in(), Ordering::Relaxed);
     shared.need_reauth.store(!sp.tokens.missing_scopes().is_empty(), Ordering::Relaxed);
 
@@ -237,10 +241,16 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let mut want_lyrics = false;
     let mut web_next = Instant::now();
     let mut last_id = String::new();
+    // 縮在系統列時換歌，這首的曲目資訊（愛心、音量）／歌詞被跳過了沒。叫回來時只補跳過的那首：
+    // 以前一律當作剛換歌，縮著期間根本沒換歌也要重打 `/me/player` 與 `/me/library/contains`
+    let mut meta_skipped = false;
+    let mut lyrics_skipped = false;
     // 剛跳轉的目標位置與時刻。Spotify 回報給 SMTC 的位置會晚一下才更新，
     // 這段時間讀到的還是跳轉前的位置；直接照登的話，畫面已經先跳過去的
     // 進度條會閃回原處、再閃回來。
     let mut seek_hold: Option<(i64, Instant)> = None;
+    // 自然接歌後 Spotify 給 SMTC 的位置早約半秒，學出來扣掉（見 lead.rs）
+    let mut lead = crate::lead::Lead::load(paths.cache.join("smtc_lead.json"));
     // 換歌後等 META_SETTLE 才問曲目資訊：(那首的 id, 到期時間)
     let mut pending_meta: Option<(String, Instant)> = None;
     let mut tracks_cache: std::collections::HashMap<String, CachedTracks> =
@@ -256,15 +266,15 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 Cmd::Visible(v) => visible = v,
                 Cmd::WantLyrics(v) => {
                     // 縮著的時候才開：這首的歌詞之前被跳過了，當作剛換歌補抓
-                    if v && !want_lyrics && in_tray {
+                    if v && !want_lyrics && in_tray && lyrics_skipped {
                         last_id.clear();
                     }
                     want_lyrics = v;
                 }
                 Cmd::Tray(v) => {
                     in_tray = v;
-                    // 叫回來：當作剛換歌，補抓縮著時跳過的歌詞與曲目資訊
-                    if !v {
+                    // 叫回來：縮著時跳過了這首的歌詞或曲目資訊，就當作剛換歌補抓
+                    if !v && (meta_skipped || lyrics_skipped) {
                         last_id.clear();
                     }
                 }
@@ -411,6 +421,16 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
             // 拉長間隔省配額。
             web_next = Instant::now() + if visible { WEB_IDLE } else { WEB_HIDDEN };
         }
+        let lead_ms = np.as_mut().map_or(0, |t| {
+            // 這個修正是跟自動對齊一起來的，對齊關著時位置照 Spotify 給的，跟沒有這個功能時一樣
+            if !crate::align::enabled() && !crate::alignrec::on() {
+                lead.idle();
+                return 0;
+            }
+            let f = lead.fix(&t.id, t.playing, t.duration_ms, t.smtc_stamp);
+            t.progress_ms = (t.progress_ms - f).max(0);
+            f
+        });
         if let (Some((ms, at)), Some(t)) = (seek_hold, np.as_mut()) {
             let expect = ms + if t.playing { at.elapsed().as_millis() as i64 } else { 0 };
             // 對上了、超過時限、或歌已經換了，就放手照實際的
@@ -438,6 +458,8 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 Some(Lyrics { source: "loading".into(), ..Default::default() });
         }
         *shared.now.lock().unwrap() = np.clone();
+        crate::alignrec::poll(np.as_ref(), lead_ms);
+        crate::align::poll(np.as_ref(), lead.sure());
         // 燈條的拾音燈只看本機：遠端裝置在播時 loopback 抓不到聲音
         crate::ledfeed::set_playing(np.as_ref().is_some_and(|t| t.playing && t.source == "smtc"));
         if let (true, Some(t)) = (changed, np.as_ref()) {
@@ -445,7 +467,9 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
             shared.generation.fetch_add(1, Ordering::Relaxed);
             // 歌詞交給另一條執行緒：一抓好幾秒，擋在這裡的話這段時間
             // 播放狀態不會更新、按暫停也要排隊
-            if !in_tray || want_lyrics {
+            lyrics_skipped = in_tray && !want_lyrics;
+            meta_skipped = in_tray;
+            if !lyrics_skipped {
                 let _ = lyrics_tx.send(t.clone());
             }
             if !in_tray {
@@ -469,6 +493,8 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         pending_meta = Some((id, due));
                     }
                 }
+                // 還沒等到就縮進系統列了：記著，叫回來再補
+                Some(t) if t.id == id => meta_skipped = true,
                 _ => {}
             }
         }
@@ -539,6 +565,7 @@ fn from_smtc(
         art,
         duration_ms: d.duration_ms,
         progress_ms: d.progress_ms,
+        smtc_stamp: d.stamp,
         device: "本機 Spotify".into(),
         shuffle: d.shuffle,
         repeat: d.repeat,
@@ -590,6 +617,7 @@ fn from_web(sp: &mut Spotify, shared: &Arc<Shared>) -> Option<NowPlaying> {
         art: Art::Url(art),
         duration_ms: it["duration_ms"].as_i64().unwrap_or(0),
         progress_ms: st["progress_ms"].as_i64().unwrap_or(0),
+        smtc_stamp: None,
         device: st["device"]["name"].as_str().unwrap_or("遠端裝置").to_string(),
         shuffle: st["shuffle_state"].as_bool().unwrap_or(false),
         repeat: match st["repeat_state"].as_str() {
@@ -620,6 +648,8 @@ fn spawn_lyrics(cfg: &Config, paths: &Paths, shared: &Arc<Shared>) -> Sender<Now
                     t = newer;
                 }
                 let got = fetcher.fetch(&cfg, &t.id, &t.artist, &t.title, &t.album, t.duration_ms, None);
+                crate::alignrec::lyrics(&t, &got);
+                crate::align::lyrics(&t.id, &got);
                 let still = shared.now.lock().unwrap().as_ref().is_some_and(|n| n.id == t.id);
                 if still {
                     *shared.lyrics.lock().unwrap() = Some(got);
