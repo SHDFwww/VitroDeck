@@ -199,7 +199,9 @@ pub fn options(st: &Style, f: &Feat) -> Vec<(Recipe, f32)> {
     let mut out = Vec::new();
     let keys = uniq(st.key_enters);
     let exits = uniq(st.exits);
-    for (t, tm) in uniq(st.templates).into_iter().filter(|(t, _)| f.fits(*t)) {
+    // v2 的直書只給短句：長的直書一欄太高，整句被縮得很小，細的手寫體就讀不到了
+    let fits = |t: Template| f.fits(t) && !(t == Template::Vertical && (!st.tall || (st.v2 && f.n > 7)));
+    for (t, tm) in uniq(st.templates).into_iter().filter(|(t, _)| fits(*t)) {
         let slam = t == Template::Slam;
         // 置中大字一律用第一種重點進場、不墊色塊也不框
         let ks: Vec<(Enter, usize)> = if slam { vec![(st.key_enters.first().copied().unwrap_or(Enter::Pop), 1)] } else { keys.clone() };
@@ -280,8 +282,51 @@ fn is_keep_punct(c: char) -> bool {
 
 /// 中文詞組最長幾個字，超過就從唱的空檔切開
 const MAX_CJK: usize = 6;
-/// 英文詞組最多幾個字母（合併短字用）
+/// 英文詞組的目標長度（字母數）。超過一點只扣分（每多一個字母 [`EN_PER_LETTER`]），
+/// 寧可稍長也不要切在冠詞、介系詞後面；超過 [`EN_HARD`] 才非切不可
 const MAX_LATIN: usize = 13;
+const EN_HARD: usize = 20;
+const EN_PER_LETTER: i32 = 25;
+/// 多切一刀的成本：不夠長的句子要有標點、空檔這類理由才切
+const EN_SPLIT: i32 = 45;
+/// 一個字自己一組：三個字母以下、剛好四個字母的扣分（I、me、fire 落單）
+const EN_TINY: i32 = 70;
+const EN_SHORT: i32 = 35;
+
+// 英文斷詞組用的字表（小寫，見 [`en_word`]）。拿 2026-10-22 快取裡 74 首英文歌調過，數字在筆記.md
+/// 後面一定接東西的：冠詞、所有格、介系詞、連接詞、限定詞。切在它們後面最糟
+const EN_HEAD: &[&str] = &[
+    "a", "an", "the", "my", "your", "his", "its", "our", "their", "to", "of", "in", "on", "at", "for", "with", "from", "by", "into", "onto", "upon",
+    "about", "through", "over", "under", "across", "against", "without", "within", "between", "behind", "beyond", "after", "before", "till", "until",
+    "'til", "since", "than", "as", "and", "but", "or", "nor", "'cause", "cause", "because", "cuz", "'cuz", "if", "when", "while", "where", "whenever",
+    "wherever", "though", "although", "unless", "every", "each", "some", "any", "no", "these", "those",
+];
+/// 通常也接著後面的：主詞、助動詞、縮寫、程度副詞、數量、her（多半是所有格）
+const EN_LEAN: &[&str] = &[
+    "i", "we", "they", "he", "she", "i'm", "i'll", "i've", "i'd", "you're", "you'll", "you've", "you'd", "we're", "we'll", "we've", "we'd", "they're",
+    "they'll", "they've", "he's", "she's", "it's", "that's", "there's", "what's", "who's", "let's", "am", "is", "are", "was", "were", "be", "been",
+    "being", "do", "does", "did", "don't", "doesn't", "didn't", "can", "can't", "cannot", "could", "couldn't", "will", "won't", "would", "wouldn't",
+    "should", "shouldn't", "must", "might", "may", "gonna", "wanna", "gotta", "have", "has", "had", "ain't", "isn't", "aren't", "wasn't", "weren't",
+    "haven't", "hasn't", "never", "always", "just", "really", "so", "very", "not", "only", "her", "that", "this", "like", "let", "should've",
+    "could've", "would've", "must've", "might've", "it'll", "that'll", "tryna", "imma", "lets", "other", "all", "much", "many", "more", "most", "few",
+    "little", "right", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "hundred", "thousand", "million",
+];
+/// 接在前一個字後面的：受詞、句尾的 too
+const EN_TAIL: &[&str] = &["me", "us", "them", "him", "too"];
+/// 片語動詞的小品詞（stand up、get out）：後面不是 [`EN_DET`] 時接在前一個字後面
+const EN_PARTICLE: &[&str] = &["up", "out", "down", "away", "back", "off"];
+const EN_DET: &[&str] = &["the", "a", "an", "my", "your", "his", "her", "our", "their", "its", "of", "to", "in", "on", "at", "this", "that"];
+/// 好的分句開頭。and、or 也常連接兩個名詞（you and I），只加一點
+const EN_CLAUSE: &[&str] = &["but", "'cause", "cause", "because", "cuz", "'cuz", "so", "when", "while", "where", "if", "till", "until", "'til", "though", "although", "unless"];
+const EN_AND: &[&str] = &["and", "or"];
+const EN_SUBJ: &[&str] = &["i", "we", "they", "he", "she", "i'm", "i'll", "i've", "i'd", "we're", "they're"];
+/// 主詞後面接助動詞就是同一個子句的頭，別在中間切（it | ain't、you | can）
+const EN_PRON: &[&str] = &["i", "you", "we", "they", "he", "she", "it", "this", "that", "there", "who"];
+const EN_AUX: &[&str] = &[
+    "am", "is", "are", "was", "were", "be", "do", "does", "did", "don't", "doesn't", "didn't", "can", "can't", "cannot", "could", "couldn't", "will",
+    "won't", "would", "wouldn't", "should", "shouldn't", "must", "might", "may", "gonna", "wanna", "gotta", "have", "has", "had", "ain't", "isn't",
+    "aren't", "wasn't", "weren't", "haven't", "hasn't", "never", "always", "just", "really", "still",
+];
 
 /// 一句拆成詞組，每組是 `GIn` 的索引。空白與不畫的標點不在任何一組裡
 pub fn phrases(g: &[GIn]) -> Vec<Vec<usize>> {
@@ -316,21 +361,115 @@ pub fn phrases(g: &[GIn]) -> Vec<Vec<usize>> {
     for p in out {
         split_long(g, &lv, p, &mut split);
     }
-    // 英文：一個字一組太碎，短的併起來
+    // 英文：照空白切完是一個字一組，太碎。連在一起的英文字重新分組
+    let latin = |p: &[usize]| p.iter().all(|&i| !is_cjk(g[i].ch));
     let mut merged: Vec<Vec<usize>> = Vec::new();
+    let mut run: Vec<Vec<usize>> = Vec::new();
     for p in split {
-        let latin = |p: &[usize]| p.iter().all(|&i| !is_cjk(g[i].ch));
-        if let Some(last) = merged.last_mut()
-            && latin(last)
-            && latin(&p)
-            && last.len() + p.len() < MAX_LATIN
-        {
-            last.extend(p);
-            continue;
+        if latin(&p) {
+            run.push(p);
+        } else {
+            merged.extend(group_latin(g, std::mem::take(&mut run)));
+            merged.push(p);
         }
-        merged.push(p);
     }
+    merged.extend(group_latin(g, run));
     merged
+}
+
+/// 一串英文字（每個是 `GIn` 的索引）分組。以前是短字往後併到 13 個字母，常把 a、the、my、on
+/// 留在上一組的尾巴（Hands on my | knees）。現在每個切點照 [`en_cut`] 打分，
+/// 一組的長短照 [`MAX_LATIN`]，動態規劃挑整串加起來最好的切法
+fn group_latin(g: &[GIn], words: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+    let n = words.len();
+    if n <= 1 {
+        return words;
+    }
+    let text: Vec<String> = words.iter().map(|w| en_word(w.iter().map(|&i| g[i].ch))).collect();
+    // 整句大寫的歌詞，句中的大寫字就不當成新句子的開頭
+    let (mut up, mut letters) = (0, 0);
+    for c in words.iter().flatten().map(|&i| g[i].ch).filter(|c| c.is_alphabetic()) {
+        letters += 1;
+        up += usize::from(c.is_uppercase());
+    }
+    let shout = up * 5 >= letters.max(1) * 4;
+    let cut: Vec<i32> = (0..n - 1).map(|k| en_cut(g, &words, &text, k, shout)).collect();
+    // best[j]：前 j 個字最好的分法的分數；from[j]：那個分法的最後一組從第幾個字開始。
+    // 一個字自己一組一定可以，所以每個 best[j] 都有值
+    let mut best = vec![i32::MIN; n + 1];
+    let mut from = vec![0; n + 1];
+    best[0] = 0;
+    for j in 1..=n {
+        let mut len = 0;
+        for i in (0..j).rev() {
+            len += words[i].len();
+            let fit = match (j - i, len) {
+                (1, ..=3) => -EN_TINY,
+                (1, 4) => -EN_SHORT,
+                (1, _) => 0,
+                (_, l) if l <= MAX_LATIN => 0,
+                (_, l) if l <= EN_HARD => -EN_PER_LETTER * (l - MAX_LATIN) as i32,
+                _ => break,
+            };
+            let score = best[i] + fit + if i > 0 { cut[i - 1] - EN_SPLIT } else { 0 };
+            if score > best[j] {
+                (best[j], from[j]) = (score, i);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut j = n;
+    while j > 0 {
+        out.push(words[from[j]..j].concat());
+        j = from[j];
+    }
+    out.reverse();
+    out
+}
+
+/// 在第 `k` 個字後面切開好不好，越大越好。`text` 是 [`en_word`] 過的字
+fn en_cut(g: &[GIn], words: &[Vec<usize>], text: &[String], k: usize, shout: bool) -> i32 {
+    let (la, lb) = (words[k][words[k].len() - 1], words[k + 1][0]);
+    let (a, b) = (text[k].as_str(), text[k + 1].as_str());
+    let mut s = 0;
+    // 中間有逗點、句點這類不畫的標點，或前一個字以驚嘆號、問號收尾：話講完了，前一個字是什麼都沒關係（Hold on, I'm…）
+    let punct = (la + 1..lb).any(|i| is_drop_punct(g[i].ch)) || is_keep_punct(g[la].ch);
+    if punct {
+        s += 90;
+    }
+    // 唱的空檔，最多算 1.2 秒
+    s += ((g[lb].t - (g[la].t + g[la].d)).clamp(0, 1200) / 12) as i32;
+    let lean = !punct && (EN_HEAD.contains(&a) || EN_LEAN.contains(&a));
+    if !punct {
+        if EN_HEAD.contains(&a) {
+            s -= 220;
+        } else if EN_LEAN.contains(&a) {
+            s -= 90;
+        }
+        if EN_PRON.contains(&a) && EN_AUX.contains(&b) {
+            s -= 90;
+        }
+    }
+    let det_next = text.get(k + 2).is_some_and(|x| EN_DET.contains(&x.as_str()));
+    if EN_TAIL.contains(&b) || (EN_PARTICLE.contains(&b) && !det_next) {
+        s -= 90;
+    }
+    if EN_CLAUSE.contains(&b) {
+        s += 45;
+    } else if EN_AND.contains(&b) || (EN_SUBJ.contains(&b) && !lean) {
+        s += 20;
+    }
+    // 句中的大寫字（I 那些除外）多半是新的一句，原文漏了標點
+    if !shout && !lean && g[lb].ch.is_uppercase() && !EN_SUBJ.contains(&b) {
+        s += 25;
+    }
+    s
+}
+
+/// 比對字表用的寫法：小寫、彎撇號換成直的、只留字母數字與撇號，結尾的撇號拿掉（beggin' → beggin）
+fn en_word(cs: impl Iterator<Item = char>) -> String {
+    let s: String = cs.flat_map(char::to_lowercase).map(|c| if c == '’' { '\'' } else { c }).filter(|c| c.is_alphanumeric() || *c == '\'').collect();
+    if ["'cause", "'cuz", "'til"].contains(&s.as_str()) { s } else { s.trim_end_matches('\'').to_string() }
 }
 
 /// `lv` 是 [`super::seg::starts`]：每個字前面切開好不好
@@ -512,19 +651,26 @@ pub fn compose(g: &[GIn], seed: u64, idx: usize, w: f32, h: f32, st: &Style, rec
         Template::Diagonal => {
             let mut x = 0.0;
             let mut line_k = Vec::new();
+            // 每個詞組從哪裡開始（em）
+            let mut starts = Vec::with_capacity(ph.len());
             for (k, p) in ph.iter().enumerate() {
                 let (xs, wk) = row(g, p, sizes[k]);
+                starts.push(x);
                 for (j, &i) in p.iter().enumerate() {
                     line_k.push((k, i, x + xs[j], sizes[k]));
                 }
                 x += wk + 0.4;
             }
-            // 太長折成兩條平行的斜線
+            // 太長折成兩條平行的斜線。從最靠中間的詞組交界折：以前照每個字的位置從正中間折，
+            // 會把一個詞組、甚至一個字拆到兩條線上（befo | re）
             let total = x - 0.4;
-            let two = total > 11.0;
-            let half = total * 0.5;
+            let mid = |a: &f32| (a - total * 0.5).abs();
+            let fold = if total > 11.0 { starts.iter().skip(1).copied().min_by(|a, b| mid(a).total_cmp(&mid(b))) } else { None };
             for (k, i, gx, s) in line_k {
-                let (gx, gy) = if two && gx > half { (gx - half + 1.2, 1.9) } else { (gx, 0.0) };
+                let (gx, gy) = match fold {
+                    Some(f) if gx >= f => (gx - f + 1.2, 1.9),
+                    _ => (gx, 0.0),
+                };
                 // 大字跟小字底部對齊（同一條基線）
                 pts.push((k, i, gx, gy - (s - 1.0) * 0.45, s, 0.0));
             }
@@ -797,6 +943,95 @@ mod tests {
         assert!(p.len() <= 3, "{p:?}");
     }
 
+    /// 切好的詞組寫回字串（原句中間隔了空白的地方補一個空白）
+    fn groups(s: &str) -> Vec<String> {
+        let g = line(s, 0, 150);
+        phrases(&g)
+            .iter()
+            .map(|p| {
+                let mut o = String::new();
+                for (k, &i) in p.iter().enumerate() {
+                    if k > 0 && i > p[k - 1] + 1 {
+                        o.push(' ');
+                    }
+                    o.push(g[i].ch);
+                }
+                o
+            })
+            .collect()
+    }
+
+    #[test]
+    fn 英文不切在冠詞與介系詞後面() {
+        for (s, together) in [
+            ("Take me down to the river tonight", ["to the river", "Take me"]),
+            ("We could stand up and fight for the light", ["stand up", "for the light"]),
+            ("But it ain't in the plan to give it all away", ["it ain't", "in the plan"]),
+            ("You and I were dancing in the middle of the night", ["in the middle", "of the night"]),
+            ("Paper boats on a silver lake", ["on a silver lake", "Paper boats"]),
+        ] {
+            let got = groups(s);
+            for w in together {
+                assert!(got.iter().any(|x| x.contains(w)), "{w} 被切開了：{got:?}");
+            }
+            // 除了最後一組，每組的最後一個字都不是冠詞、介系詞、所有格、連接詞
+            for x in &got[..got.len() - 1] {
+                let last = en_word(x.rsplit(' ').next().unwrap_or("").chars());
+                assert!(!EN_HEAD.contains(&last.as_str()), "{x} 結尾是 {last}：{got:?}");
+            }
+            // 整句大寫切法一樣
+            let shout: Vec<String> = groups(&s.to_uppercase()).iter().map(|x| x.to_lowercase()).collect();
+            assert_eq!(shout, got.iter().map(|x| x.to_lowercase()).collect::<Vec<_>>(), "{s}");
+        }
+        // 逗點後面是新的一組，就算前一個字是 on 這類介系詞（Hold on, …）
+        assert_eq!(groups("Wait here, I'm walking home"), ["Wait here", "I'm walking home"]);
+        assert_eq!(groups("Hang on, we can make it"), ["Hang on", "we can make it"]);
+        // 中英夾雜：中文自己一組，後面的英文照英文分
+        assert_eq!(groups("我愛你 baby tonight"), ["我愛你", "baby tonight"]);
+    }
+
+    /// 快取歌詞裡純英文的句子怎麼分組，寫成文字檔（跟調參數用的 Python 原型逐句對照）：
+    /// `VITRO_LYRICS_CACHE=<cache\lyrics> VITRO_DUMP=<輸出檔> cargo test --bin vitro 英文分組傾印 -- --ignored`
+    #[test]
+    #[ignore]
+    fn 英文分組傾印() {
+        let dir = std::env::var("VITRO_LYRICS_CACHE").expect("VITRO_LYRICS_CACHE");
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .expect("讀不到快取資料夾")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('k') && n.ends_with(".json")))
+            .collect();
+        files.sort();
+        let mut out = String::new();
+        for f in files {
+            let Ok(ly) = serde_json::from_str::<crate::lyrics::Lyrics>(&std::fs::read_to_string(&f).unwrap_or_default()) else { continue };
+            let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            for (k, l) in ly.synced.iter().enumerate() {
+                if l.text.chars().any(is_cjk) || l.text.split_whitespace().count() < 2 {
+                    continue;
+                }
+                let next = ly.synced.get(k + 1).map_or(l.t + 4000, |n| n.t);
+                let g: Vec<GIn> = l.text.chars().zip(crate::pv::char_times(l, next)).map(|(ch, (t, d))| probe(ch, t, d)).collect();
+                let parts: Vec<String> = phrases(&g)
+                    .iter()
+                    .map(|p| {
+                        let mut o = String::new();
+                        for (j, &i) in p.iter().enumerate() {
+                            if j > 0 && i > p[j - 1] + 1 {
+                                o.push(' ');
+                            }
+                            o.push(g[i].ch);
+                        }
+                        o
+                    })
+                    .collect();
+                out += &format!("{stem}\t{k}\t{}\n", parts.join(" | "));
+            }
+        }
+        std::fs::write(std::env::var("VITRO_DUMP").expect("VITRO_DUMP"), out).expect("寫不進輸出檔");
+    }
+
     #[test]
     fn 構圖在畫面內而且可重現() {
         let g = line("那是今晚最後一班列車", 1000, 250);
@@ -825,6 +1060,31 @@ mod tests {
             for w in ts.windows(2) {
                 assert_ne!(w[0], w[1], "{look:?} {ts:?}");
             }
+        }
+    }
+
+    #[test]
+    fn 斜線從詞組交界折行() {
+        let g = line("Say it, before the dawn", 0, 150);
+        let ph = phrases(&g);
+        assert_eq!(ph.len(), 2, "{ph:?}");
+        let rec = Recipe { template: Template::Diagonal, side: 0, key_enter: Enter::Pop, exit: Exit::Scatter, band: false, corners: false };
+        for look in LOOKS {
+            let l = compose(&g, 42, 0, 1280.0, 720.0, &Style::of(look), Some(&rec));
+            assert_eq!(l.template, Template::Diagonal);
+            // 轉回斜線自己的方向量高度：同一組的字在同一條線上，兩組分在兩條線
+            let (sn, cs) = l.tilt.sin_cos();
+            let ys: Vec<Vec<f32>> = ph
+                .iter()
+                .map(|p| l.glyphs.iter().filter(|q| p.contains(&q.i)).map(|q| (q.y - l.cy) * cs - (q.x - l.cx) * sn).collect())
+                .collect();
+            for y in &ys {
+                let (lo, hi) = y.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                assert!(hi - lo < 0.5, "{look:?} 一組拆到兩條線：{ys:?}");
+            }
+            // 大小字底部對齊本來就會差一點高度，折行差的是將近兩個字高
+            let big = l.glyphs.iter().map(|q| q.size).fold(0.0, f32::max);
+            assert!((ys[1][0] - ys[0][0]).abs() > big * 0.5, "{look:?} 沒有折行：{ys:?}");
         }
     }
 }

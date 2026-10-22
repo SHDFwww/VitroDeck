@@ -162,9 +162,19 @@ pub struct Config {
     /// 歌詞頁的文字 PV 模式（實驗中，歌詞頁按 P 切換）：全螢幕演出、跟著節拍動。
     /// 開著時歌詞頁會開 loopback 擷取抓節拍。Rust 版才有
     pub lyrics_pv: bool,
+    /// 文字 PV 的第二版做法（實驗中，只在 `lyrics_pv` 開著時有作用、設定視窗也才出現）：
+    /// 整首一個風格與場景、前後句留在畫面上、顏色只從封面來。關著就是原本的文字 PV。Rust 版才有
+    pub lyrics_pv_v2: bool,
+    /// 文字PV_v2 的背景幾何圖形（實驗中，v2 開著才有作用、設定視窗也才出現）：很淡的圓、方、三角、叉
+    /// 跟著低音到高音起伏。Rust 版才有
+    pub lyrics_pv_geo: bool,
     /// 主視窗的畫面更新率上限（0 = 跟隨螢幕）。實際取螢幕更新率能整除、不超過它的值，
     /// 幀才會平均落在垂直同步上。視覺效果頁照 `viz_fps`。Rust 版才有
     pub fps_limit: u32,
+    /// 主視窗的工作列按鈕上顯示播放進度（像瀏覽器下載檔案時那條，暫停時變黃）。Rust 版才有
+    pub taskbar_progress: bool,
+    /// 主視窗的標題（工作列按鈕、Alt+Tab 上的字）換成正在播的「歌手 - 歌名」。Rust 版才有
+    pub taskbar_title: bool,
 
     /// 不認得的欄位原樣留著寫回去。少了這個，存一次設定就會把
     /// Python 版（或之後的版本）的欄位全部刪掉。
@@ -213,7 +223,11 @@ impl Default for Config {
             font_scale: 1.0,
             ui_scale: 1.0,
             lyrics_pv: false,
+            lyrics_pv_v2: false,
+            lyrics_pv_geo: false,
             fps_limit: 0,
+            taskbar_progress: false,
+            taskbar_title: false,
             extra: Default::default(),
         }
     }

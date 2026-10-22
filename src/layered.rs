@@ -333,13 +333,13 @@ mod test_app {
             r.quads.push(Quad::new(bx, by, bw * p, 4.0 * s).radius(2.0 * s).color([1.0, 1.0, 1.0, 0.85]));
 
             r.text.begin();
-            r.text.push("一場遊戲一場夢", bx, y0 + 18.0 * s, 17.0 * s, 22.0 * s,
+            r.text.push("一整面封面牆", bx, y0 + 18.0 * s, 17.0 * s, 22.0 * s,
                         [1.0, 1.0, 1.0, 0.95], 600, Some(bw), None);
             let mode = if layered { "分層" } else { "DWM" };
             let sub = if self.locked {
-                format!("王傑 · {mode} · 已鎖定（穿透）")
+                format!("VitroDeck · {mode} · 已鎖定（穿透）")
             } else {
-                format!("王傑 · {mode} · 拖曳移動、Esc 結束")
+                format!("VitroDeck · {mode} · 拖曳移動、Esc 結束")
             };
             r.text.push(&sub, bx, y0 + 44.0 * s, 13.0 * s, 18.0 * s,
                         [1.0, 1.0, 1.0, 0.6], 400, Some(bw), None);

@@ -737,7 +737,7 @@ mod tests {
     fn atlas_不會被動畫字級塞滿() {
         let gpu = crate::gfx::Gpu::headless().unwrap();
         let mut t = Text::new(&gpu, crate::gfx::OFFSCREEN_FORMAT);
-        let line = "너의 모든 것을 원해 and some more 一場遊戲一場夢 王傑";
+        let line = "한글 글꼴 테스트 and some more 一定要傳承我的意志 VitroDeck";
         for i in 0..3000 {
             let size = 10.0 + (i % 760) as f32 * 0.25;
             t.begin();

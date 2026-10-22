@@ -2,11 +2,12 @@
 //!
 //! 日文用 TinySegmenter（約 25 KB 的小模型），切完把助詞、助動詞、送假名黏回前一個詞，
 //! 變成「君の」「聞こえた」這種文節。中文用 jieba，繁體先轉簡體再切（詞典是簡體），
-//! 「的、了、著」這類單字黏回前一個詞。
+//! 再照詞性把詞併成類似文節的詞組（[`zh_words`]）：「的、了、著」、方位詞黏回前一個詞，
+//! 副詞、介詞、助動詞、數量詞黏到後一個詞。
 
 use std::sync::OnceLock;
 
-use jieba_rs::Jieba;
+use jieba_rs::{Jieba, Tag};
 
 fn jieba() -> &'static Jieba {
     static J: OnceLock<Jieba> = OnceLock::new();
@@ -114,22 +115,68 @@ fn attaches(prev: &[char], w: &[char]) -> bool {
     JA_FUNC.contains(&s.as_str()) || (w.len() <= 2 && is_func(prev))
 }
 
-/// 中文：jieba 切詞，語助詞黏回前一個詞
+/// 中文：jieba 切詞＋詞性，照 [`zh_level`] 併成詞組。
+/// 只看 jieba 的詞邊界時，「不｜屬於」「被窩｜裡」「最｜熟悉」跟真正的詞組邊界一樣好切，長句常從這些地方斷開
 fn zh_words(chars: &[char]) -> Option<Vec<u8>> {
     let s: String = chars.iter().collect();
     // 詞典是簡體。轉了字數要一樣才用（逐字對齊），不一樣就拿原文切
     let simp = crate::zh::tw2s(&s);
     let text = if simp.chars().count() == chars.len() { simp } else { s };
+    let words = jieba().tag(&text, true);
+    let blank = |w: &Tag| w.word.chars().all(char::is_whitespace);
     let mut out = vec![0u8; chars.len()];
-    let mut prev_space = true;
-    for t in jieba().cut(&text, true) {
-        let func = t.end - t.start == 1 && "的了着过吗呢吧啊呀哦喔啦嘛地得们么".contains(t.word);
-        if t.start < out.len() && !(func && !prev_space) {
-            out[t.start] = 2;
+    for (k, w) in words.iter().enumerate() {
+        if w.start >= out.len() {
+            continue;
         }
-        prev_space = t.word.chars().all(char::is_whitespace);
+        out[w.start] = if k == 0 || blank(w) || blank(&words[k - 1]) {
+            2
+        } else {
+            let pp = k.checked_sub(2).map(|j| &words[j]).filter(|x| !blank(x));
+            let last = words.get(k + 1).is_none_or(blank);
+            zh_level(pp, &words[k - 1], w, last)
+        };
     }
     Some(out)
+}
+
+/// 在 `w` 前面切開好不好，`p` 是前一個詞、`pp` 再前一個，`last` 是 `w` 為這串最後一個詞。
+/// 0 = 當成同一個詞（的、了、著），1 = 同一個詞組，2 = 詞組的開頭
+fn zh_level(pp: Option<&Tag>, p: &Tag, w: &Tag, last: bool) -> u8 {
+    let len = |x: &Tag| x.word.chars().count();
+    let noun = |x: &Tag| x.tag.starts_with('n') || x.tag == "r";
+    // 介詞。「和、跟」jieba 標連詞，後面接人或東西時當介詞（和你、跟我）
+    let prep = |x: &Tag, next: &Tag| {
+        (x.tag == "p" && next.tag != "p") || (["和", "跟", "与", "同"].contains(&x.word) && noun(next))
+    };
+    // 語助詞、結構助詞
+    if (len(w) == 1 && "的了着过吗呢吧啊呀哦喔啦嘛地得们么".contains(w.word)) || w.tag.starts_with('u') || w.tag == "y" {
+        return 0;
+    }
+    let left =
+        // 方位詞：被窩裡、失憶中、道別之前
+        (w.tag == "f" && len(w) <= 2)
+        // 「的」後面的單字名詞（心愛的人），或句尾的短名詞（荒唐的玩笑、自焚的牢籠），不要單獨落一行
+        || (p.word.ends_with('的') && ((len(w) == 1 && w.tag.starts_with('n')) || (last && len(w) <= 2)))
+        // 兩字動詞後面的單字補語：準備好
+        || (len(p) >= 2 && p.tag.starts_with('v') && len(w) == 1 && w.tag == "a")
+        // 名詞接名詞：jieba 拆開的複合詞
+        || (p.tag.starts_with('n') && w.tag.starts_with('n'))
+        // 介詞＋受詞＋動詞：對自己苛責、在那守護、和你道別
+        || pp.is_some_and(|pp| prep(pp, p) && noun(p) && (w.tag.starts_with('v') || w.tag.starts_with('a') || w.tag.starts_with('n')));
+    let right =
+        // 副詞：不、最、也、都、就、才、還
+        (p.tag == "d" && len(p) <= 2)
+        || prep(p, w)
+        // 數量詞接名詞或量詞：無數強心針、那場雨
+        || (matches!(p.tag, "m" | "mq" | "q") && (w.tag.starts_with('n') || w.tag == "q"))
+        // 這、那開頭的代詞：這一切、那種命
+        || (p.tag == "r" && (p.word.starts_with('这') || p.word.starts_with('那')))
+        // 單字形容詞接名詞或副詞：重感情、早已經
+        || (len(p) == 1 && p.tag == "a" && (w.tag.starts_with('n') || w.tag == "d"))
+        // 助動詞、使役：能發生、會記得、讓人、想你
+        || ["能", "会", "要", "该", "想", "可以", "能够", "不会", "怎能", "无法", "没", "没有", "让", "被"].contains(&p.word);
+    if left || right { 1 } else { 2 }
 }
 
 #[cfg(test)]
@@ -147,6 +194,26 @@ mod tests {
             o.push(*ch);
         }
         o
+    }
+
+    #[test]
+    fn 中文照詞性併成詞組() {
+        // 實際歌詞裡被切開過的：副詞、介詞往後黏，方位詞、的後面的單字往前黏
+        for (line, keep) in [
+            ("最怕回到被窩裡的夢境振作", "被窩裡的"),
+            ("成為最熟悉的陌生人", "最熟悉的"),
+            ("何必留戀在不屬於我的地方", "在不屬於"),
+            ("放不下心愛的人匆匆離去", "心愛的人"),
+            ("還沒準備好去面對沒有你的世界", "還沒準備好"),
+            ("在數不清的失憶中照亮黑夜裡的星", "黑夜裡的星"),
+            ("就算是重感情的廢物希望你回來", "重感情的"),
+        ] {
+            let s = show(line).replace('.', "");
+            assert!(s.split('|').any(|p| p.contains(keep)), "{keep} 被切開了：{s}");
+        }
+        // 「的、了、著」跟前一個詞算同一個詞，詞組裡也不從這裡切
+        let c: Vec<char> = "我試著鬆開手".chars().collect();
+        assert_eq!(starts(&c)[2], 0);
     }
 
     #[test]

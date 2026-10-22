@@ -2,7 +2,7 @@
 //
 // 字形的材質是距離場（pv/sdf.rs）：0.5 是字的邊，往上是字裡面，±SPREAD 個圖集像素。
 // 放大多少都是同一張圖，描邊與光暈只是換門檻 —— 所以字可以任意放大、旋轉、傾斜。
-// 矩形、圓環、圓盤不讀材質，距離直接算，跟字形共用後面那一段上色。
+// 矩形、圓環、圓盤、三角形、叉不讀材質，距離直接算，跟字形共用後面那一段上色。
 
 struct Cam {
     // 邏輯解析度、鏡頭的支點
@@ -22,7 +22,7 @@ struct Inst {
     @location(1) uv: vec4<f32>,    // 圖集裡的 u0, v0, u1, v1
     @location(2) color: vec4<f32>, // 填色（直通 alpha）
     @location(3) line: vec4<f32>,  // 描邊色 rgb、描邊寬（邏輯 px）
-    @location(4) xf: vec4<f32>,    // 旋轉、傾斜、每圖集像素多少實體 px、形狀（0 字 1 矩形 2 圓環 3 圓盤 4 漸層矩形 5 柔光條 6 暗角 7 顆粒 8 網點）
+    @location(4) xf: vec4<f32>,    // 旋轉、傾斜、每圖集像素多少實體 px、形狀（0 字 1 矩形 2 圓環 3 圓盤 4 漸層矩形 5 柔光條 6 暗角 7 顆粒 8 網點 9 三角形 10 叉）
     @location(5) fx: vec4<f32>,    // 光暈寬（邏輯 px）、光暈強度、填色倍率（空心字 0）、不受鏡頭影響（1）
     @location(6) ex: vec4<f32>,    // 失焦（邏輯 px）、光澤掃到哪（-1.5..1.5）、光澤強度、由下往上露出的進度（0 是不遮）
 };
@@ -95,6 +95,23 @@ fn sd_box(p: vec2<f32>, b: vec2<f32>) -> f32 {
     return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
 }
 
+// 撐滿半邊長 h 方框的等腰三角形：尖在上緣中間、底邊是下緣（Inigo Quilez 的 sdTriangleIsosceles，
+// 尖移到原點、往 +y 長，q 是底的半寬與高）
+fn sd_tri(p: vec2<f32>, h: f32) -> f32 {
+    let q = vec2<f32>(h, 2.0 * h);
+    let r = vec2<f32>(abs(p.x), p.y + h);
+    let a = r - q * clamp(dot(r, q) / dot(q, q), 0.0, 1.0);
+    let b = r - q * vec2<f32>(clamp(r.x / q.x, 0.0, 1.0), 1.0);
+    let d = min(vec2<f32>(dot(a, a), r.y * q.x - r.x * q.y), vec2<f32>(dot(b, b), q.y - r.y));
+    return -sqrt(d.x) * sign(d.y);
+}
+
+// 叉：兩條斜 45° 的方條伸到半邊長 h 方框的四個角，臂寬是邊長的 0.28
+fn sd_cross(p: vec2<f32>, h: f32) -> f32 {
+    let q = rot2(p, 0.7853982);
+    return min(sd_box(q, vec2<f32>(1.131 * h, 0.283 * h)), sd_box(q, vec2<f32>(0.283 * h, 1.131 * h)));
+}
+
 // 整層進出的柔邊遮罩：只留下 x 在 c.z 右邊的部分，邊界前後各 c.w 漸變（邏輯 px）。
 // c.w 是 0 就是沒在進出、整層都留
 @fragment
@@ -154,7 +171,7 @@ fn shade(in: VsOut) -> vec4<f32> {
         let a = abs(n) * in.color.a;
         let c = select(vec3<f32>(0.0), vec3<f32>(1.0), n > 0.0);
         return vec4<f32>(c * a, a);
-    } else {
+    } else if (mode < 8.5) {
         // 網點：45° 斜的點陣，點距 line.x 邏輯 px；圓心的點最大（佔格子 line.y 成）、往外縮到沒有，
         // 所以邊緣沒有硬切的線。line.z 讓整片點陣斜著平移
         let sp = max(in.line.x, 2.0);
@@ -164,6 +181,10 @@ fn shade(in: VsOut) -> vec4<f32> {
         let r = sp * 0.5 * in.line.y * pow(g, 0.8);
         let a = clamp((r - length(cell)) * k + 0.5, 0.0, 1.0) * in.color.a;
         return vec4<f32>(in.color.rgb * a, a);
+    } else if (mode < 9.5) {
+        d = -sd_tri(in.local, in.half_size.x) * k;
+    } else {
+        d = -sd_cross(in.local, in.half_size.x) * k;
     }
 
     var ow = 0.0;

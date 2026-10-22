@@ -8,7 +8,7 @@
 use super::layout::{Enter, Exit, Template};
 use super::plan::Part;
 use super::scene::Scene;
-use super::tint;
+use super::{tint, v2};
 use crate::lyrics::Lyrics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -128,6 +128,10 @@ pub struct Style {
     pub leaks: bool,
     /// 整套配色轉了幾度色相（[`Style::tinted`]，0 是原本的配色）
     pub hue: f32,
+    /// 文字PV_v2 收斂過的（[`Style::v2`]）：顏色到畫的時候才從封面推（[`Style::painted`]）
+    pub v2: bool,
+    /// 可以用直書（v2 的階梯不用：直書一欄太高，會壓到上下兩階）
+    pub tall: bool,
 }
 
 const WHITE: [f32; 4] = [0.97, 0.97, 0.98, 1.0];
@@ -182,6 +186,8 @@ impl Style {
             grid: false,
             leaks: false,
             hue: 0.0,
+            v2: false,
+            tall: true,
         };
         match look {
             Look::Neon => neon,
@@ -466,13 +472,20 @@ impl Style {
     /// 場景要的調整：縱深的句子會被推近放大，先排小一點；大字帶、飛越的光塵已經夠滿，不墊超大淡字
     pub fn scened(mut self, scene: Scene) -> Self {
         match scene {
+            // v2 的一般場景是捲動，上下還要擺前後句（跑馬燈、追光、殘響同）
+            Scene::Plain | Scene::Spotlight | Scene::Echo | Scene::Marquee if self.v2 => {
+                self.fill *= 0.6;
+                self.tall = false;
+                self.ghost = false;
+            }
             Scene::Plain => {}
+            // v2 的長卷要看得到前後句，每句排小一點
             Scene::Flight => {
-                self.fill *= 0.85;
+                self.fill *= if self.v2 { 0.75 } else { 0.85 };
                 self.ghost = false;
             }
             Scene::Depth => {
-                self.fill *= 0.6;
+                self.fill *= if self.v2 { 0.62 } else { 0.6 };
                 self.cap *= 0.72;
                 self.ghost = false;
             }
@@ -482,18 +495,23 @@ impl Style {
             }
             Scene::Wall => self.ghost = false,
             // 轉盤、階梯、分鏡同時有好幾句在畫面上，每句排小一點才不會疊成一團
+            // v2 的階梯下面還要擺下一句，再小一點
             Scene::Carousel | Scene::Cascade => {
-                self.fill *= 0.72;
+                let v2 = self.v2 && scene == Scene::Cascade;
+                self.fill *= if v2 { 0.66 } else { 0.72 };
+                self.tall = !v2;
                 self.cap *= 0.82;
                 self.ghost = false;
             }
+            // v2 的鐘擺旁邊還斜掛著下一句
             Scene::Split | Scene::Pendulum => {
-                self.fill *= 0.88;
+                self.fill *= if self.v2 && scene == Scene::Pendulum { 0.75 } else { 0.88 };
                 self.ghost = false;
             }
             // 句子收到上半部，下半部留給倒影
             Scene::Mirror => {
-                self.fill *= 0.82;
+                self.fill *= if self.v2 { 0.6 } else { 0.82 };
+                self.tall &= !self.v2;
                 self.cap *= 0.85;
                 self.ghost = false;
             }
@@ -510,6 +528,60 @@ impl Style {
             // 已經有殘響字了，不再墊超大淡字
             Scene::Echo => self.ghost = false,
         }
+        self
+    }
+
+    /// 文字PV_v2：一首歌一套、顏色只從封面來，所以拿掉多色與一直在動的東西
+    /// （色差、閃光、鼓點圓環、集中線、切片、光粒、漏光、網點、網格），描邊、空心、硬陰影也拿掉
+    /// （細的手寫體描邊會糊成一團）。唱到的字會發光，那團光另外畫（不看 `glow`）
+    pub fn v2(mut self) -> Self {
+        self.v2 = true;
+        self.hollow = 0.0;
+        self.stroke = None;
+        self.shadow = None;
+        self.chroma = 0.0;
+        self.flash = 0.0;
+        self.ring = false;
+        self.rays = false;
+        self.slices = false;
+        self.sparks = false;
+        self.seal = false;
+        self.halftone = false;
+        self.grid = false;
+        self.leaks = false;
+        self.shake *= 0.4;
+        self.pump *= 0.6;
+        self.band_p *= 0.5;
+        self.corners_p *= 0.5;
+        self.bokeh *= 0.35;
+        self.grain *= 0.6;
+        self.bars = self.bars.min(0.08);
+        self.shine = self.shine.min(0.3);
+        self
+    }
+
+    /// 文字PV_v2 的配色：關鍵字與裝飾是封面強調色本身與它的淡版；底是夜色（深藍一類），
+    /// 色相挑離強調色最遠的（[`v2::night`]），字是帶一點點底色的白。不是 v2 的原樣回傳
+    pub fn painted(mut self, accent: [f32; 4]) -> Self {
+        if !self.v2 {
+            return self;
+        }
+        let p = tint::lab([accent[0], accent[1], accent[2]]);
+        let (ch, h) = (p[1].hypot(p[2]), p[2].atan2(p[1]));
+        let (nh, nk) = v2::night(h.to_degrees(), ch);
+        let c = |l: f32, k: f32, h: f32, a: f32| {
+            let [r, g, b] = tint::lch(l, k, h);
+            [r, g, b, a]
+        };
+        // 同色相推出來的暗底，金、橘這類強調色會變咖啡色。墊得夠厚，後面封面的顏色才不會把夜色染髒
+        let nh = nh.to_radians();
+        self.bg = c(0.2, 0.045 * nk, nh, 0.85);
+        self.ink = c(0.96, 0.01 * nk, nh, 1.0);
+        self.key_ink = Some(c(p[0].max(0.82), ch.min(0.16), h, 1.0));
+        self.band = Some(c(0.6, ch.min(0.13), h, 1.0));
+        self.band_ink = c(0.97, ch.min(0.01), h, 1.0);
+        self.line = c(0.82, ch.min(0.07), h, 1.0);
+        self.vig = [0.0; 3];
         self
     }
 
@@ -561,12 +633,15 @@ pub struct Segment {
     pub scene: Scene,
     /// 這段的配色轉幾度色相（[`super::vary::paint`] 配的）
     pub hue: f32,
+    /// 文字PV_v2 的段落（風格照 [`Style::v2`] 收斂）
+    pub v2: bool,
 }
 
 impl Segment {
     /// 這段的風格（含配色，不含副歌、場景的調整）
     pub fn style(&self) -> Style {
-        Style::of(self.look).tinted(self.hue)
+        let st = Style::of(self.look).tinted(self.hue);
+        if self.v2 { st.v2() } else { st }
     }
 }
 
@@ -606,7 +681,7 @@ pub fn segments(ly: &Lyrics, parts: &[Part]) -> Vec<Segment> {
     }
     starts
         .into_iter()
-        .map(|first| Segment { first, t: ly.synced[first].t, look: Look::Neon, chorus: chorus(first), scene: Scene::Plain, hue: 0.0 })
+        .map(|first| Segment { first, t: ly.synced[first].t, look: Look::Neon, chorus: chorus(first), scene: Scene::Plain, hue: 0.0, v2: false })
         .collect()
 }
 

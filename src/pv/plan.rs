@@ -57,15 +57,23 @@ const PRE_LINES: usize = 2;
 const SHORT: usize = 3;
 
 impl Plan {
-    /// `force` 是使用者鎖定的風格（整首歌只用它）；`w`、`h` 是畫面大小（鏡頭移多遠）
-    pub fn build(ly: &Lyrics, seed: u64, force: Option<Look>, w: f32, h: f32) -> Self {
+    /// `force` 是使用者鎖定的風格（整首歌只用它）；`w`、`h` 是畫面大小（鏡頭移多遠）。
+    /// `v2` 是文字PV_v2：整首一個風格＋場景、不轉色（[`super::v2`]）
+    pub fn build(ly: &Lyrics, seed: u64, force: Option<Look>, w: f32, h: f32, v2: bool) -> Self {
         let parts = parts(ly);
         let mut segs = style::segments(ly, &parts);
         let feats = vary::feats(ly);
-        vary::cast(&mut segs, ly, &feats, seed, force);
-        vary::paint(&mut segs, seed);
+        if v2 {
+            let (look, scene) = super::v2::world(ly, &segs, seed, force);
+            for s in &mut segs {
+                (s.look, s.scene, s.hue, s.v2) = (look, scene, 0.0, true);
+            }
+        } else {
+            vary::cast(&mut segs, ly, &feats, seed, force);
+            vary::paint(&mut segs, seed);
+        }
         let steps = cam::steps(ly, &parts, &segs, seed, w, h);
-        let tracks = scene::tracks(ly, &segs, seed, w, h);
+        let tracks = scene::tracks(ly, &segs, seed, w, h, v2);
         let recipes = vary::recipes(&segs, &parts, &feats, seed);
         Self { parts, segs, steps, tracks, recipes }
     }
@@ -324,7 +332,7 @@ mod tests {
     #[test]
     fn 強度換句時平滑變過去() {
         let ly = song(&[V1, CHO, V2, CHO]);
-        let plan = Plan::build(&ly, 1, None, 1920.0, 1080.0);
+        let plan = Plan::build(&ly, 1, None, 1920.0, 1080.0, false);
         let t = ly.synced.iter().find(|l| l.text == CHO[0]).unwrap().t;
         let before = plan.level_at(&ly, t - 2000);
         let mid = plan.level_at(&ly, t);

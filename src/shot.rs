@@ -829,8 +829,8 @@ fn build_text_scene(t: &mut Text) {
     t.push("VitroDeck　原生介面測試", 40.0, 22.0, 30.0, 40.0, [1.0, 1.0, 1.0, 1.0], 700, None, None);
 
     // 歌名／演出者，粗細與大小不同
-    t.push("一場遊戲一場夢", 40.0, 660.0, 26.0, 34.0, [1.0, 1.0, 1.0, 0.95], 600, None, None);
-    t.push("王傑 · 一場遊戲一場夢 (1987)", 260.0, 666.0, 17.0, 24.0, [1.0, 1.0, 1.0, 0.55], 400, None, None);
+    t.push("一整面封面牆", 40.0, 660.0, 26.0, 34.0, [1.0, 1.0, 1.0, 0.95], 600, None, None);
+    t.push("VitroDeck · 一整面封面牆 (2026)", 260.0, 666.0, 17.0, 24.0, [1.0, 1.0, 1.0, 0.55], 400, None, None);
 
     // 逐句歌詞，驗長句斷行
     t.push(
@@ -885,10 +885,10 @@ pub fn anthem() -> bool {
     std::env::var("VITRO_DEMO").is_ok_and(|v| v == "anthem")
 }
 pub fn demo_title() -> &'static str {
-    if anthem() { "中華民國國歌" } else { "一場遊戲一場夢" }
+    if anthem() { "中華民國國歌" } else { "一整面封面牆" }
 }
 pub fn demo_artist() -> &'static str {
-    if anthem() { "程懋筠" } else { "王傑" }
+    if anthem() { "程懋筠" } else { "VitroDeck" }
 }
 pub fn demo_pos_ms() -> i64 {
     if anthem() { 31_000 } else { 64_300 }
@@ -1707,7 +1707,7 @@ fn glass_lab(
         quads.flush(gpu, &mut pass, w, h);
     }
     text.begin();
-    for (i, s) in ["那只是昨夜的一場夢境", "我還是我 你還是你", "Kind of Blue — Miles Davis"].iter().enumerate() {
+    for (i, s) in ["一整面封面牆", "一定要傳承我的意志", "You have to carry on my legacy"].iter().enumerate() {
         text.push(s, 40.0, 160.0 + i as f32 * 60.0, 40.0, 52.0, theme::ink(0.92), 700, None, None);
     }
     for (i, s) in ["淺色背景上的深色字", "Light backdrop", "玻璃壓在這裡"].iter().enumerate() {

@@ -500,7 +500,7 @@ impl Spotify {
     /// 使用者的播放清單（自己建的＋追蹤的），欄位對齊專輯好讓封面流混著放。
     ///
     /// 2026-02 起開發者模式只讀得到「自己建立或共同編輯」的清單內容，
-    /// 追蹤的清單只有封面與名稱、沒有 items 欄位 —— `own` 標記哪些能展開。
+    /// 追蹤的清單只有封面與名稱、讀不到曲目 —— `own` 標記哪些能展開。
     pub fn fetch_all_playlists(&mut self) -> Result<Vec<Album>, ApiError> {
         let me = self.get("/me", &[])?.unwrap_or_default();
         let my_id = me["id"].as_str().unwrap_or("").to_string();
@@ -521,9 +521,15 @@ impl Spotify {
                 let cnt = pl["items"]["total"].as_u64().or_else(|| pl["tracks"]["total"].as_u64());
                 let (art, art_sm) = images(&pl["images"]);
                 let owner_id = owner["id"].as_str().unwrap_or("");
+                let id = str_of(&pl["id"]);
+                // 用邀請連結加入的協作者，API 照樣回 collaborative=false，
+                // 也沒有別的欄位分得出來 —— 別人的清單只能實際讀一次試試
+                let own = (!my_id.is_empty() && owner_id == my_id)
+                    || pl["collaborative"].as_bool().unwrap_or(false)
+                    || self.playlist_readable(&id)?;
                 let n = out.len() as u32;
                 out.push(Album {
-                    id: str_of(&pl["id"]),
+                    id,
                     uri: str_of(&pl["uri"]),
                     name: str_of(&pl["name"]),
                     artist: owner["display_name"]
@@ -536,8 +542,7 @@ impl Spotify {
                     tracks: cnt.unwrap_or(0) as u32,
                     kind: "playlist".into(),
                     order: Some(n),
-                    own: (!my_id.is_empty() && owner_id == my_id)
-                        || pl["collaborative"].as_bool().unwrap_or(false),
+                    own,
                     ..Default::default()
                 });
             }
@@ -547,6 +552,16 @@ impl Spotify {
             }
         }
         Ok(out)
+    }
+
+    /// 別人的清單讀不讀得到內容。被拒（403／404）就是讀不到；
+    /// 限流與斷線往上丟，別因為一時抓不到就把清單標成不能展開。
+    fn playlist_readable(&mut self, pid: &str) -> Result<bool, ApiError> {
+        match self.get(&format!("/playlists/{pid}/items"), &[("limit", "1".into())]) {
+            Ok(v) => Ok(v.is_some_and(|v| v["items"].is_array())),
+            Err(ApiError::Status(_) | ApiError::NotReadable) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// 專輯裡的曲目。這個端點不帶封面與專輯名，呼叫端用專輯那張補上。
@@ -731,10 +746,10 @@ mod tests {
     fn 清單曲目新舊兩種鍵都接() {
         // 2026-02 起是 item，以前是 track；episode 要跳過，但位置照算
         let new = json!({ "id": "a", "uri": "spotify:track:a", "name": "甲", "type": "track",
-                          "artists": [{ "name": "王傑" }, { "name": "某某" }], "duration_ms": 1000 });
+                          "artists": [{ "name": "VitroDeck" }, { "name": "某某" }], "duration_ms": 1000 });
         let t = track_of(&new, 0, 3);
         assert_eq!(t.uri, "spotify:track:a");
-        assert_eq!(t.artist, "王傑, 某某");
+        assert_eq!(t.artist, "VitroDeck, 某某");
         assert_eq!(t.pos, Some(3));
         assert_eq!(t.id, "t0:a");
         assert!(t.is_track() && !t.can_drill());
@@ -752,10 +767,10 @@ mod tests {
 
     #[test]
     fn 能不能展開與副標() {
-        let al = Album { uri: "spotify:album:x".into(), kind: "album".into(), artist: "王傑".into(),
+        let al = Album { uri: "spotify:album:x".into(), kind: "album".into(), artist: "VitroDeck".into(),
                          year: "1989".into(), tracks: 10, ..Default::default() };
         assert!(al.can_drill());
-        assert_eq!(al.subtitle(), "王傑  ·  1989  ·  10 首");
+        assert_eq!(al.subtitle(), "VitroDeck  ·  1989  ·  10 首");
         // 舊版 Rust 寫的快取沒有 kind：當專輯
         let old = Album { uri: "spotify:album:x".into(), ..Default::default() };
         assert!(old.can_drill());

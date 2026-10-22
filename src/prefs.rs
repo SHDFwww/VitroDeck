@@ -109,7 +109,6 @@ impl Ctx<'_> {
             Item::SpotifyStatus => self.st.spotify_hint.clone(),
             Item::Version => self.st.update_hint.clone(),
             Item::DataDir => self.st.data_dir.clone(),
-            Item::Device => "切換到另一台 Spotify 裝置（D）".into(),
             Item::About => "授權、致謝，以及中斷 Spotify 連結（I）".into(),
             Item::UiScale if !self.st.zoom_note.is_empty() => self.st.zoom_note.clone(),
             _ => it.hint().to_string(),
@@ -301,6 +300,11 @@ fn page_rows(p: &mut Paint, w: f32, top: f32, ui: &Ui, an: &mut Anims, ctx: &Ctx
     let mut y = top + win::PAD + win::HEAD_H;
 
     for (title, items) in page.groups() {
+        // 跟著別的開關才出現的列（文字PV_v2）現在不畫；整組都不畫就連組一起跳過
+        let items: Vec<Item> = items.iter().copied().filter(|it| !it.hidden(cfg)).collect();
+        if items.is_empty() {
+            continue;
+        }
         if !title.is_empty() {
             y += wd::group_title_h();
         }
@@ -438,8 +442,8 @@ const SAME_AS_CJK: &str = "跟中文字型一樣";
 
 /// 預覽框的三行字：標題級（粗）、內文級、說明級
 const PREVIEW: [(&str, theme::Type, u16, f32); 3] = [
-    ("一場遊戲一場夢 Kind of Blue", ty::TITLE, 600, 0.95),
-    ("那只是昨夜的一場夢境 That's just the way it is", ty::BODY_S, 400, 0.85),
+    ("一整面封面牆 VitroDeck", ty::TITLE, 600, 0.95),
+    ("一定要傳承我的意志 You have to carry on my legacy", ty::BODY_S, 400, 0.85),
     ("0123456789 ABCDEFG abcdefg，。「」() ?!", ty::CAPTION, 400, 0.55),
 ];
 
@@ -1009,7 +1013,7 @@ impl Prefs {
 
     /// 焦點往上或往下一項，跳過停用的
     fn move_focus(&mut self, cfg: &Config, d: isize) {
-        let items: Vec<Item> = self.page().items().into_iter().filter(|it| !it.disabled(cfg)).collect();
+        let items: Vec<Item> = self.page().items().into_iter().filter(|it| !it.disabled(cfg) && !it.hidden(cfg)).collect();
         if items.is_empty() {
             return;
         }

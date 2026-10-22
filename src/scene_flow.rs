@@ -640,19 +640,20 @@ pub fn fake_albums(gpu: &Gpu, n: usize) -> Vec<Album> {
         .ok()
         .and_then(|p| std::fs::read(&p).ok())
         .and_then(|b| crate::gfx::upload_encoded(gpu, &b, "real-art").ok());
+    // 名字都是編的（不用真的專輯），中英、長短混著，最後一個的歌手名刻意很長
     const NAMES: &[(&str, &str)] = &[
-        ("一場遊戲一場夢", "王傑"),
-        ("范特西", "周杰倫"),
-        ("Random Access Memories", "Daft Punk"),
-        ("後青春期的詩", "五月天"),
-        ("Kind of Blue", "Miles Davis"),
-        ("愛情萬歲", "張惠妹"),
-        ("OK Computer", "Radiohead"),
-        ("太平盛世", "陳奕迅"),
-        ("Discovery", "Daft Punk"),
-        ("小宇宙", "五月天"),
-        ("In Rainbows", "Radiohead"),
-        ("流浪到淡水", "金門王與李炳輝"),
+        ("一整面封面牆", "VitroDeck"),
+        ("傳承", "示範樂團"),
+        ("Carry On My Legacy", "The Placeholders"),
+        ("夜行列車", "無名氏"),
+        ("Blue Hour Sketches", "Demo Quartet"),
+        ("午後的雨", "測試合唱團"),
+        ("Signal Test", "Null Pointer"),
+        ("城市的另一邊", "示範樂團"),
+        ("Second Light", "The Placeholders"),
+        ("一整片星空", "無名氏"),
+        ("Rainbow Test Pattern", "Null Pointer"),
+        ("走到河邊的那條路", "某甲與某乙二重唱"),
     ];
     let size = 320u32;
     (0..n)

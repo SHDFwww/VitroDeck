@@ -82,7 +82,8 @@ pub struct LyricPick {
 pub struct PvIn<'a> {
     pub pv: &'a mut crate::pv::Pv,
     /// 演的是哪份歌詞、唱到哪（已加補償）。平常就是這首的；剛切歌、要退回一般歌詞頁的那一段，
-    /// 是上一首留下來的（`Now::lyrics` 已經換成「載入中」了）
+    /// 是上一首留下來的（`Now::lyrics` 已經換成「載入中」了）。
+    /// v2 演著的時候切歌、新歌的歌詞還沒到，給的是空的（只演片頭曲名卡）
     pub lyrics: &'a Lyrics,
     pub ms: i64,
     /// 一般歌詞頁換成 PV 的進度（0..1，補間過）。0 與 1 之間兩邊都畫：PV 從右邊漫過來、
@@ -94,6 +95,18 @@ pub struct PvIn<'a> {
     pub chrome: f32,
     /// 鎖定的演出風格，`None` 照段落自動換
     pub look: Option<crate::pv::style::Look>,
+    /// 設定裡的「文字PV_v2」
+    pub v2: bool,
+    /// v2 的片頭、片尾曲名卡、間奏光帶要的：歌名、歌手、整首多長（毫秒）、頻譜
+    pub title: &'a str,
+    pub artist: &'a str,
+    pub duration: i64,
+    pub spec: [f32; crate::pv::idle::SPEC],
+    /// 設定的「背景幾何圖形」與它跟的五個頻段（`audio::Spectrum::bands`，[`crate::pv::geo`]）
+    pub geo: bool,
+    pub bands: [f32; 5],
+    /// 這一幀演出層畫完先存起來：v2 下一幀要換一份歌詞了（[`crate::pv::Pv::freeze`]）
+    pub freeze: bool,
 }
 
 /// PV 模式左欄後面那片磨砂：模糊多重（跟其他模糊錯開，快取才不會互蓋）、右緣淡出多寬
@@ -256,8 +269,8 @@ pub fn render_with(
     mut pv: Option<PvIn<'_>>,
 ) -> anyhow::Result<LyricHits> {
     let mut hits = LyricHits::default();
-    // PV 只演有時間軸的歌詞；沒有的照原本的右欄說明。完全退回去了也不畫
-    if pv.as_ref().is_some_and(|p| p.lyrics.synced.is_empty() || p.mix <= 0.0) {
+    // PV 只演有時間軸的歌詞；沒有的照原本的右欄說明（v2 換歌等歌詞的那段例外）。完全退回去了也不畫
+    if pv.as_ref().is_some_and(|p| (p.lyrics.synced.is_empty() && !p.v2) || p.mix <= 0.0) {
         pv = None;
     }
     let pv_on = pv.is_some();
@@ -317,7 +330,22 @@ pub fn render_with(
             inset: l.lyrics_x * chrome,
             look: p.look,
             mix,
+            v2: p.v2,
+            title: p.title,
+            artist: p.artist,
+            duration: p.duration,
+            trans: now.show_trans,
+            spec: p.spec,
+            geo: p.geo,
+            bands: p.bands,
         });
+        // v2 換一份歌詞：換之前那一幀存起來，換之後疊在演出上面淡掉（左欄與磨砂不在裡面）
+        if p.freeze {
+            p.pv.freeze(gpu, &mut enc, target, p.now);
+        } else if let Some((view, a, s)) = p.pv.ghost((w, h), p.now) {
+            let (gw, gh) = (fw * s, fh * s);
+            quads.push_tex(Quad::new((fw - gw) * 0.5, (fh - gh) * 0.5, gw, gh).textured().color([1.0, 1.0, 1.0, a * mix]), &view);
+        }
         // 控制項出來的時候，左欄後面墊一片淺灰磨砂：把演出那一格模糊掉再蒙一層灰，
         // 右緣很寬地淡進演出裡，看不出一條邊。演出換成米白底的風格時左欄的字也還讀得到
         let frost_a = chrome * mix;

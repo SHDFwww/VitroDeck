@@ -55,6 +55,7 @@ mod spotify;
 mod viz;
 mod vinyl;
 mod text;
+mod taskbar;
 mod theme;
 mod tray;
 mod update;
@@ -455,6 +456,10 @@ struct PvSnap {
     /// 曲目＋歌詞來源＋句數，變了才重存一份
     key: String,
     track: String,
+    /// 歌名、歌手、整首多長（v2 的片頭、片尾曲名卡）
+    title: String,
+    artist: String,
+    dur: i64,
     lyrics: lyrics::Lyrics,
     ms: i64,
     at: Instant,
@@ -553,6 +558,8 @@ struct App {
     proxy: winit::event_loop::EventLoopProxy<UserEv>,
     /// 主視窗縮在系統列（藏起來、停畫）
     in_tray: bool,
+    /// 工作列按鈕上的播放進度與字（`taskbar_progress`、`taskbar_title`）
+    taskbar: taskbar::Taskbar,
     mini: Option<mini::Mini>,
     /// 上次告訴 poller 的「迷你視窗要歌詞」
     mini_ly_sent: bool,
@@ -627,11 +634,19 @@ struct App {
     /// 一般歌詞頁換成文字 PV 的進度（1 = PV）。目標是 `pv_want`
     pv_mix: anim::Tween,
     /// 現在該不該是 PV：開著、這首的歌詞有時間軸、切歌後待滿 `pv::HOLD_S`
+    /// （v2 演著的時候切歌不用待，見 `pv_carry`）
     pv_want: bool,
     /// 上次看到的曲目與換到它的時刻
     pv_track: (String, Instant),
+    /// v2 演著的時候切到這首的：歌詞還在載入就接著演曲名卡等它（最多 `pv::BRIDGE_S`），
+    /// 到了有逐字就接著演；沒有逐字或等太久就放掉，照一般的規則退回一般歌詞頁
+    pv_carry: bool,
     /// PV 演的那份歌詞（見 [`PvSnap`]），退回一般歌詞頁之後清掉
     pv_snap: Option<PvSnap>,
+    /// v2 演著的時候要換一份歌詞：這一幀照舊演、畫完存起來（`pv_freeze`），下一幀才換成 `pv_swap` 這份，
+    /// 換完存起來的那幀疊在上面淡掉（[`pv::Pv::freeze`]）
+    pv_swap: Option<String>,
+    pv_freeze: bool,
     last_mouse: Instant,
     /// 游標位置（實體像素，跟畫面座標同一套）
     cursor: (f32, f32),
@@ -647,6 +662,8 @@ struct App {
     /// 畫面上最後一次有東西該動的時間：播放中、換歌、提示、視窗被叫回來。
     /// 跟 `last_input` 取較近的那個，算沒在播又沒人動多久（`CALM`）
     stir: Instant,
+    /// 文字 PV 演出中、控制列收起來時把游標藏起來（動一下滑鼠控制列出來，游標也跟著出來）
+    cursor_hidden: bool,
     /// 主視窗停畫中（縮小、或暫停太久）。迷你視窗與設定視窗照常
     parked: Option<Parked>,
     /// winit 說主視窗看不見（Windows 上是縮小）
@@ -1725,6 +1742,29 @@ impl App {
         (playing, id, toast)
     }
 
+    /// 工作列按鈕上的播放進度與字（視窗標題）。每次迴圈醒來都叫（停畫時也每 `PARK_POLL` 醒一次），
+    /// 送不送、換不換由 `Taskbar` 決定
+    fn sync_taskbar(&mut self) {
+        let Some(w) = self.window.as_deref() else { return };
+        let (show, title) = {
+            let now = self.player.shared.now.lock().ok();
+            let n = now.as_ref().and_then(|g| g.as_ref());
+            let show = match n {
+                Some(n) if self.cfg.taskbar_progress => {
+                    let pos = n.progress_ms + if n.playing { n.at.elapsed().as_millis() as i64 } else { 0 };
+                    taskbar::Show::of(true, n.playing, pos, n.duration_ms)
+                }
+                _ => taskbar::Show::Off,
+            };
+            let (artist, name) = n.map_or(("", ""), |n| (n.artist.as_str(), n.title.as_str()));
+            (show, self.taskbar.title(self.cfg.taskbar_title, zh::enabled(), artist, name))
+        };
+        self.taskbar.update(w, show);
+        if let Some(t) = title {
+            w.set_title(&t);
+        }
+    }
+
     /// 主視窗停畫：不排下一幀、關掉只給畫面用的擷取，迴圈改成定時醒來看一下（`about_to_wait`）
     fn park(&mut self, el: &ActiveEventLoop) {
         self.parked = Some(Parked { at: Instant::now(), hidden: self.hidden(), sig: self.stir_sig() });
@@ -2169,10 +2209,12 @@ impl App {
             HIDE_S
         };
         let step = dt / dur;
+        // 到了就停在那裡。往下那邊要擋在 want：等於的時候也走往下的話，展開時每幀在 1 和 1 - step 之間跳，
+        // 文字 PV 的鏡頭跟著 `inset` 一幀放大一幀縮小，整片在抖
         self.chrome_t = if want > self.chrome_t {
             (self.chrome_t + step).min(1.0)
         } else {
-            (self.chrome_t - step).max(0.0)
+            (self.chrome_t - step).max(want)
         };
         self.chrome = if !genie {
             // CSS 的 cubic-bezier(.4,0,.2,1)，用 smoothstep 近似就夠了
@@ -2185,6 +2227,14 @@ impl App {
         } else {
             self.chrome_t.powf(2.2)
         };
+        // 文字 PV 整個漫進來、控制列也完全收起來了（滑鼠停了 `IDLE_HIDE`，沒開面板），PV 佔滿畫面：游標也藏起來
+        let hide = self.view == View::Now && self.trans.is_none() && self.pv_mix.value() >= 0.999 && self.chrome_t <= 0.0;
+        if hide != self.cursor_hidden
+            && let Some(win) = &self.window
+        {
+            win.set_cursor_visible(!hide);
+            self.cursor_hidden = hide;
+        }
     }
 
     /// 設定面板開著時的鍵盤。**它會把按鍵吃掉** —— 不然在面板裡按方向鍵
@@ -3242,31 +3292,52 @@ impl App {
             _ => n.progress_ms + if n.playing { n.at.elapsed().as_millis() as i64 } else { 0 },
         });
         // 文字 PV 與一般歌詞頁之間：切歌時不知道下一首有沒有時間軸，一律先退回一般歌詞頁，
-        // 至少待 `HOLD_S`，歌詞到了、有逐字才再漫回 PV（只有逐句的不演）。進出都補間，不硬切
+        // 至少待 `HOLD_S`，歌詞到了、有逐字才再漫回 PV（只有逐句的不演）。進出都補間，不硬切。
+        // v2 演著的時候切歌不退：接著演下一首的片頭曲名卡等歌詞，到了有逐字就接著演（`pv_carry`）
         {
             let id = now.as_ref().map_or("", |n| n.id.as_str());
+            let v2 = self.cfg.lyrics_pv && self.cfg.lyrics_pv_v2;
             if id != self.pv_track.0 {
+                self.pv_carry = v2 && self.pv_want && !id.is_empty();
                 self.pv_track = (id.to_string(), Instant::now());
                 self.stir = Instant::now();
             }
             let guard = self.player.shared.lyrics.lock().ok();
-            let synced = guard.as_ref().and_then(|g| g.as_ref()).filter(|l| l.has_words());
-            let held = self.pv_track.1.elapsed().as_secs_f32() >= pv::HOLD_S;
-            self.pv_want = self.cfg.lyrics_pv && held && synced.is_some();
+            let cur = guard.as_ref().and_then(|g| g.as_ref());
+            let synced = cur.filter(|l| l.has_words());
+            let loading = cur.is_none_or(|l| l.source == "loading");
+            let since = self.pv_track.1.elapsed().as_secs_f32();
+            let (want, waiting) = pv::gate(self.cfg.lyrics_pv, v2, &mut self.pv_carry, loading, synced.is_some(), since);
+            self.pv_want = want;
             if self.cfg.lyrics_pv && (synced.is_some() || self.pv_mix.value() > 0.0) {
                 self.pv_ear = Some(Instant::now());
             }
-            if self.pv_want
-                && let Some(ly) = synced {
-                    // 演的那份另外存一份：切歌那一刻共用的歌詞就換成「載入中」了，退場還要接著演
-                    let key = format!("{id}|{}|{}|{}", ly.source, ly.provider, ly.synced.len());
-                    let ms = pos_now + lyrics::shift(&self.cfg, Some(ly));
-                    let playing = now.as_ref().is_some_and(|n| n.playing);
-                    match self.pv_snap.as_mut() {
-                        Some(s) if s.key == key => (s.ms, s.at, s.playing) = (ms, Instant::now(), playing),
-                        _ => self.pv_snap = Some(PvSnap { key, track: id.to_string(), lyrics: ly.clone(), ms, at: Instant::now(), playing }),
+            // 演的那份另外存一份：切歌那一刻共用的歌詞就換成「載入中」了，退場還要接著演。
+            // 等歌詞的那段存一份空的（PV 只演曲名卡）
+            let next = match synced {
+                _ if !self.pv_want => None,
+                _ if waiting => Some((format!("{id}|bridge"), None)),
+                Some(ly) => Some((format!("{id}|{}|{}|{}", ly.source, ly.provider, ly.synced.len()), Some(ly))),
+                None => None,
+            };
+            if let Some((key, ly)) = next {
+                let ms = pos_now + ly.map_or(0, |l| lyrics::shift(&self.cfg, Some(l)));
+                let playing = now.as_ref().is_some_and(|n| n.playing);
+                match self.pv_snap.as_mut() {
+                    Some(s) if s.key == key => (s.ms, s.at, s.playing) = (ms, Instant::now(), playing),
+                    // v2 演著的時候換一份：這一幀照舊演、畫完存起來，下一幀才換，換完存起來的那幀疊在上面淡掉
+                    Some(_) if v2 && self.view == View::Now && self.pv_mix.value() > 0.0 && self.pv_swap.as_deref() != Some(key.as_str()) => {
+                        self.pv_swap = Some(key);
+                        self.pv_freeze = true;
+                    }
+                    _ => {
+                        let (title, artist, dur) = now.as_ref().map_or_else(Default::default, |n| (n.title.clone(), n.artist.clone(), n.duration_ms));
+                        let lyrics = ly.cloned().unwrap_or_default();
+                        self.pv_snap = Some(PvSnap { key, track: id.to_string(), title, artist, dur, lyrics, ms, at: Instant::now(), playing });
+                        (self.pv_swap, self.pv_freeze) = (None, false);
                     }
                 }
+            }
             drop(guard);
             let to = if self.pv_want { 1.0 } else { 0.0 };
             // 不在歌詞頁就直接到位，切回歌詞頁時交給頁面轉場
@@ -3277,6 +3348,7 @@ impl App {
             }
             if self.pv_mix.value() <= 0.0 && !self.pv_want {
                 self.pv_snap = None;
+                (self.pv_swap, self.pv_freeze) = (None, false);
             }
         }
         let roll = {
@@ -3326,10 +3398,11 @@ impl App {
             let (fw, fh) = gfx::logical(tw, th);
             let nl = ui::now(fw, fh);
             let mix = self.pv_mix.value();
+            // v2 換歌接著演、歌詞還沒到的那段，演的那份是空的
             let pvc = self
                 .pv_snap
                 .as_ref()
-                .filter(|s| mix > 0.0 && !s.lyrics.synced.is_empty())
+                .filter(|s| mix > 0.0 && (!s.lyrics.synced.is_empty() || self.cfg.lyrics_pv_v2))
                 .map(|_| {
                     let ch = self.trans.as_ref().filter(|t| t.from == View::Now).map_or(self.chrome, |t| t.chrome0);
                     scene_now::pv_chrome(mix, ch)
@@ -3611,9 +3684,17 @@ impl App {
                         mix,
                         track: &s.track,
                         pulse: self.spec.lock().map(|s| s.pulse).unwrap_or_default(),
+                        spec: self.spec.lock().map(|s| pv::idle::spec_from(&s.level)).unwrap_or_default(),
+                        geo: self.cfg.lyrics_pv_geo,
+                        bands: self.spec.lock().map(|s| s.bands).unwrap_or_default(),
+                        title: &s.title,
+                        artist: &s.artist,
+                        duration: s.dur,
                         now: Instant::now(),
                         chrome: self.trans.as_ref().filter(|t| t.from == View::Now).map_or(self.chrome, |t| t.chrome0),
                         look: self.pv_look,
+                        v2: self.cfg.lyrics_pv_v2,
+                        freeze: std::mem::take(&mut self.pv_freeze),
                     })
                 } else {
                     None
@@ -3996,6 +4077,7 @@ impl ApplicationHandler<UserEv> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        self.sync_taskbar();
         self.sync_mini(el);
         self.tick_mini();
         self.sync_prefs(el);
@@ -4076,10 +4158,15 @@ impl ApplicationHandler<UserEv> for App {
             WindowEvent::ThemeChanged(_) | WindowEvent::Focused(true) => self.sync_appearance(),
             // 控制列的出現只跟滑鼠移動綁定，鍵盤不影響。
             WindowEvent::CursorMoved { position, .. } => {
-                self.last_mouse = Instant::now();
                 // winit 給實體像素，版面與命中測試是邏輯像素
                 let k = gfx::scale();
-                self.cursor = (position.x as f32 / k, position.y as f32 / k);
+                let at = (position.x as f32 / k, position.y as f32 / k);
+                // 位置沒變的移動不算動（Windows 偶爾會送，藏游標時也可能送一次）：
+                // 不然文字 PV 收起的控制列會被叫回來、游標一藏就又出來
+                if (at.0 - self.cursor.0).abs() + (at.1 - self.cursor.1).abs() > 0.5 {
+                    self.last_mouse = Instant::now();
+                }
+                self.cursor = at;
                 if let (Some(_), Some(r)) = (self.seek_drag, self.progress_rect()) {
                     self.seek_drag = Some(((self.cursor.0 - r.x) / r.w).clamp(0.0, 1.0));
                 }
@@ -4379,7 +4466,7 @@ fn probe() -> anyhow::Result<()> {
             match sp.fetch_all_playlists() {
                 Ok(pl) => {
                     let own = pl.iter().filter(|p| p.own).count();
-                    println!("播放清單       OK  {} 個，自己的 {own} 個", pl.len());
+                    println!("播放清單       OK  {} 個，讀得到內容的 {own} 個", pl.len());
                     if let Some(p) = pl.iter().find(|p| p.own) {
                         let id = p.uri.rsplit(':').next().unwrap_or("");
                         match sp.fetch_playlist_tracks(id) {
@@ -4542,6 +4629,7 @@ fn main() -> anyhow::Result<()> {
         seek_drag: None,
         proxy: tray_proxy,
         in_tray: false,
+        taskbar: Default::default(),
         mini: None,
         mini_ly_sent: false,
         mini_recall: false,
@@ -4595,7 +4683,10 @@ fn main() -> anyhow::Result<()> {
         pv_mix: anim::Tween::new(0.0, pv::MIX_S, anim::EASE),
         pv_want: false,
         pv_track: (String::new(), Instant::now()),
+        pv_carry: false,
         pv_snap: None,
+        pv_swap: None,
+        pv_freeze: false,
         chrome_t: 1.0,
         last_mouse: now,
         cursor: (-1.0, -1.0),
@@ -4606,6 +4697,7 @@ fn main() -> anyhow::Result<()> {
         last_input: now,
         prefs_focused: false,
         stir: now,
+        cursor_hidden: false,
         parked: None,
         occluded: false,
         pv_ear: None,

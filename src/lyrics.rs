@@ -59,12 +59,25 @@ pub struct Lyrics {
 
 /// 來源鏈每加一種來源就 +1。0 是 Python 版與更早的 Rust 版寫的。
 /// 2：LyricsPlus 的結果開始核對是不是同一首（`unverified`）
-const CHAIN_VERSION: u8 = 2;
+/// 3：同一首的別的錄音（現場、混音、別的語言）不收（`matching::other_recording`）
+const CHAIN_VERSION: u8 = 3;
 
-/// 2 之前 LyricsPlus 給的逐字沒核對過是不是同一首（曾把美秀集團〈小老婆〉配成〈卷菸〉），
-/// 要重驗一次，重抓空手也不能沿用。酷狗一直有走 `matching::pick`，不用重驗
+/// LyricsPlus 給的逐字要重驗的。2 之前沒核對過是不是同一首（曾把美秀集團〈小老婆〉配成〈卷菸〉），
+/// 重抓空手也不能沿用；2 的只差沒擋過別的錄音，見 `fetch_cached`。
+/// 酷狗一直有走 `matching::pick`，不用重驗
 fn unverified(c: &Lyrics) -> bool {
-    c.source == "word" && c.provider != "KuGou" && c.chain < 2
+    c.source == "word" && c.provider != "KuGou" && c.chain < CHAIN_VERSION
+}
+
+/// 這次問 LyricsPlus 的情形。重驗 2 的逐字快取時要分清楚「這次沒拿到」跟「回了別的錄音」
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LpNote {
+    /// 沒設、有拿到、或沒有這首／搜到別首
+    Quiet,
+    /// 連不上、或伺服器出錯（這次不算數）
+    Down,
+    /// 回了同一首的別的錄音，沒收
+    Other,
 }
 
 /// 比對歌詞要用的總偏移 = 全域設定 + 這首的偏移（手動優先，沒有才用自動對齊的）。
@@ -270,18 +283,23 @@ fn merge_trans(dst: &mut Lyrics, src: &Lyrics) {
 
 /// LyricsPlus 照曲名搜到的那一首，是不是我們要的這首。它搜不到原曲時會回同歌手的別首
 /// （〈小老婆〉回了〈卷菸〉），所以要拿回應的 `metadata` 再核對一次。
-/// 回應沒附曲名就無從核對，照舊收下
-fn lyricsplus_same_song(meta: &serde_json::Value, artist: &str, title: &str, duration_ms: i64) -> bool {
+/// 回應沒附曲名就無從核對，照舊收下。`any_version`：只看是不是同一首，不管是哪個錄音
+/// （去掉版本註記再比，見 `matching::other_recording`）。同一張專輯、一樣長的也去掉註記再比
+/// （`matching::same_release`）
+fn lyricsplus_same_song(meta: &serde_json::Value, artist: &str, title: &str, album: &str, duration_ms: i64, any_version: bool) -> bool {
     let got = meta["title"].as_str().unwrap_or("").trim();
     if got.is_empty() {
         return true;
     }
+    let got_album = meta["album"].as_str().unwrap_or("");
+    let got_ms = meta["totalDuration"].as_str().and_then(parse_clock).unwrap_or(0);
+    let strip = any_version || matching::same_release(got_album, got_ms, album, duration_ms);
     let c = matching::Candidate {
         id: String::new(),
-        title: got.to_string(),
+        title: if strip { matching::core_title(got) } else { got.to_string() },
         artist: meta["artist"].as_str().unwrap_or("").to_string(),
-        album: meta["album"].as_str().unwrap_or("").to_string(),
-        duration_ms: meta["totalDuration"].as_str().and_then(parse_clock).unwrap_or(0),
+        album: got_album.to_string(),
+        duration_ms: got_ms,
     };
     matching::plausible(&c, artist, title, duration_ms)
 }
@@ -389,12 +407,26 @@ impl Fetcher {
                 return c.clone();
             }
 
-        let fresh = self
-            .fetch_fresh(cfg, artist, title, album, duration_ms, platform_id, bad)
-            .map(|mut f| {
-                f.chain = CHAIN_VERSION;
-                f
-            });
+        let (lp, note) = self.lyricsplus(cfg, artist, title, album, duration_ms, platform_id);
+        // 2 的逐字只差沒擋過別的錄音。LyricsPlus 這次給了逐字、或回了別的錄音（手上這份多半就是它）才換；
+        // 其他時候沿用，也不改問酷狗：QQ 音樂有些歌現在問會 404，不能因此把對的逐字丟掉。
+        // 連不上（或伺服器出錯）就留著下次再驗，其他（這次沒有、搜到別首）蓋章
+        let lp_words = lp.as_ref().is_some_and(|l| l.has_words() && !bad.contains(&l.provider));
+        if let Some(c) = &cached
+            && c.chain == 2 && unverified(c) && !lp_words && note != LpNote::Other {
+                let mut c = c.clone();
+                self.misses.insert(key.to_string());
+                if note == LpNote::Quiet {
+                    c.chain = CHAIN_VERSION;
+                    let _ = config::write_json(&path, &c);
+                }
+                return c;
+            }
+
+        let fresh = self.fetch_fresh(cfg, artist, title, album, duration_ms, lp, bad).map(|mut f| {
+            f.chain = CHAIN_VERSION;
+            f
+        });
 
         // 重抓失敗、或抓到的比手上這份還空，就沿用舊的，並記著這次別再試。
         match (fresh, cached) {
@@ -434,6 +466,7 @@ impl Fetcher {
         !cfg.lyricsplus_url.trim().is_empty() || cached.chain < CHAIN_VERSION
     }
 
+    /// 整條來源鏈重抓一次。`lp` 是先問過的 LyricsPlus 拿到的
     #[allow(clippy::too_many_arguments)]
     fn fetch_fresh(
         &self,
@@ -442,13 +475,13 @@ impl Fetcher {
         title: &str,
         album: &str,
         duration_ms: i64,
-        platform_id: Option<&str>,
+        lp: Option<Lyrics>,
         bad: &[String],
     ) -> Option<Lyrics> {
         let skip = |p: &str| bad.iter().any(|b| b == p);
         // 逐字來源：自架 LyricsPlus、酷狗。命中後若沒有翻譯，再向網易雲借。
         let mut degraded = false;
-        let mut word = self.lyricsplus(cfg, artist, title, album, duration_ms, platform_id).filter(|l| !skip(&l.provider));
+        let mut word = lp.filter(|l| !skip(&l.provider));
         if word.is_none() && cfg.lyrics_kugou && !skip("KuGou") {
             match kugou::fetch(&self.http, artist, title, duration_ms) {
                 matching::Outcome::Hit(l) => word = Some(l),
@@ -492,11 +525,12 @@ impl Fetcher {
         album: &str,
         duration_ms: i64,
         platform_id: Option<&str>,
-    ) -> Option<Lyrics> {
+    ) -> (Option<Lyrics>, LpNote) {
         let base = cfg.lyricsplus_url.trim().trim_end_matches('/');
         if base.is_empty() {
-            return None;
+            return (None, LpNote::Quiet);
         }
+        let (mut other, mut flaky) = (false, false);
         let dur = format!("{:.2}", duration_ms as f64 / 1000.0);
         let sources = cfg.lyricsplus_sources.trim();
 
@@ -523,8 +557,10 @@ impl Fetcher {
             for (k, v) in &cfg.lyricsplus_headers {
                 req = req.header(k.as_str(), v.as_str());
             }
-            let resp = req.send().ok()?;
+            let Ok(resp) = req.send() else { return (None, LpNote::Down) };
             if !resp.status().is_success() {
+                // 404 是真的沒有；5xx 是伺服器（或它背後的 QQ 音樂）出錯
+                flaky |= resp.status().is_server_error();
                 continue;
             }
             let Ok(data) = resp.json::<serde_json::Value>() else { continue };
@@ -533,7 +569,9 @@ impl Fetcher {
                 continue;
             }
             let is_word = data["type"].as_str() == Some("Word");
-            if !by_id && !lyricsplus_same_song(&data["metadata"], artist, title, duration_ms) {
+            if !by_id && !lyricsplus_same_song(&data["metadata"], artist, title, album, duration_ms, false) {
+                // 是同一首、只是別的錄音的話記下來
+                other |= lyricsplus_same_song(&data["metadata"], artist, title, album, duration_ms, true);
                 continue;
             }
 
@@ -576,16 +614,24 @@ impl Fetcher {
             // LyricsPlus 會說是哪個站給的（QQ Music / Apple Music / …），
             // 拿來顯示在狀態列，使用者才知道逐字是從哪來的。
             let prov = data["metadata"]["source"].as_str().unwrap_or("").trim().to_string();
-            return Some(Lyrics {
+            let got = Lyrics {
                 synced: out,
                 plain: String::new(),
                 source: if has_words { "word".into() } else { "synced".into() },
                 provider: if prov.is_empty() { "LyricsPlus".into() } else { prov },
                 error: None,
                 ..Default::default()
-            });
+            };
+            return (Some(got), LpNote::Quiet);
         }
-        None
+        let note = if other {
+            LpNote::Other
+        } else if flaky {
+            LpNote::Down
+        } else {
+            LpNote::Quiet
+        };
+        (None, note)
     }
 
     /// 來源二：LRCLIB（行級）。三段式，一段比一段寬鬆。
@@ -665,6 +711,12 @@ impl Fetcher {
             && r.status().is_success()
                 && let Ok(v) = r.json::<serde_json::Value>() {
                     let mut cands = v.as_array().cloned().unwrap_or_default();
+                    // 搜尋會連現場版、混音版一起回，長度又可能剛好接近（同一張專輯、一樣長的除外）
+                    cands.retain(|c| {
+                        let ms = (c["duration"].as_f64().unwrap_or(0.0) * 1000.0).round() as i64;
+                        !matching::other_recording(c["trackName"].as_str().unwrap_or(""), title)
+                            || matching::same_release(c["albumName"].as_str().unwrap_or(""), ms, album, duration_ms)
+                    });
                     cands.sort_by_key(|c| {
                         let has_synced = c["syncedLyrics"].as_str().is_some_and(|s| !s.is_empty());
                         let delta = (c["duration"].as_f64().unwrap_or(0.0).round() as i64 - dur).abs();
@@ -771,6 +823,91 @@ mod tests {
         crate::config::write_json(&dir.join("align.json"), &std::collections::BTreeMap::from([("k1".to_string(), e)])).unwrap();
         let l = f.fetch(&cfg, "k1", "A", "B", "", 200_000, None);
         assert_eq!(l.source, "none", "{} {}", l.provider, l.source);
+        for n in ["k1.json", "align.json"] {
+            let _ = std::fs::remove_file(dir.join(n));
+        }
+    }
+
+    /// 假的 LyricsPlus：每個連線讀完請求就回同一份回應，`None` 是讀完直接斷線（等於連不上）。回傳網址
+    fn fake_lyricsplus(resp: Option<(u16, String)>) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if let Some((code, body)) = &resp {
+                    let head = format!("HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = s.write_all(head.as_bytes()).and_then(|_| s.write_all(body.as_bytes()));
+                }
+            }
+        });
+        url
+    }
+
+    /// 2 的逐字快取重驗：連不上或伺服器出錯留著下次再驗、這次沒有（或只有行級）沿用並蓋章、
+    /// 回了別的錄音才換掉、回了對的錄音的逐字換成新的
+    #[test]
+    fn 重驗舊的逐字快取() {
+        use super::{Line, Lyrics, Word};
+        let dir = std::env::temp_dir().join(format!("vitro-lyrics-reverify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = Lyrics {
+            synced: vec![Line {
+                t: 1000,
+                text: "舊".into(),
+                words: Some(vec![Word { t: 1000, d: 800, text: "舊".into() }]),
+                ..Default::default()
+            }],
+            source: "word".into(),
+            provider: "QQ Music".into(),
+            chain: 2,
+            ..Default::default()
+        };
+        let reply = |title: &str, kind: &str, album: &str| {
+            let v = serde_json::json!({
+                "type": kind,
+                "metadata": { "title": title, "artist": "A", "album": album, "totalDuration": "200.0", "source": "QQ Music" },
+                "lyrics": [{ "time": 1000, "duration": 800, "text": "新", "syllabus": [{ "time": 1000, "duration": 800, "text": "新" }] }],
+            });
+            Some((200, v.to_string()))
+        };
+        // LRCLIB 用配錯清單擋掉、酷狗與網易雲關掉，整個測試不碰外網
+        let e = crate::align::Entry { bad: vec!["LRCLIB".into()], ..Default::default() };
+        crate::config::write_json(&dir.join("align.json"), &std::collections::BTreeMap::from([("k1".to_string(), e)])).unwrap();
+        for (case, server, source, text, chain) in [
+            ("斷線", None, "word", "舊", 2),
+            ("502", Some((502, String::new())), "word", "舊", 2),
+            ("404", Some((404, String::new())), "word", "舊", 3),
+            // 其他來源都關了，換掉以後是「沒有」
+            ("別的錄音", reply("B (Live)", "Word", "Live 專輯"), "none", "", 3),
+            ("同一張專輯", reply("B (Live)", "Word", "Hits"), "word", "新", 3),
+            ("只有行級", reply("B", "Line", "Hits"), "word", "舊", 3),
+            ("對的逐字", reply("B", "Word", "Hits"), "word", "新", 3),
+        ] {
+            crate::config::write_json(&dir.join("k1.json"), &old).unwrap();
+            let cfg = Config {
+                lyricsplus_url: fake_lyricsplus(server),
+                lyrics_kugou: false,
+                lyrics_netease: false,
+                lyrics_traditional: false,
+                ..Default::default()
+            };
+            let got = Fetcher::new(dir.clone()).fetch(&cfg, "k1", "A", "B", "Hits", 200_000, None);
+            let disk: Lyrics = crate::config::read_json(&dir.join("k1.json"));
+            for (l, what) in [(&got, "回傳"), (&disk, "快取")] {
+                let first = l.synced.first().map_or("", |x| x.text.as_str());
+                assert_eq!((l.source.as_str(), first), (source, text), "{case}：{what}");
+            }
+            assert_eq!(disk.chain, chain, "{case}：版本章");
+        }
         for n in ["k1.json", "align.json"] {
             let _ = std::fs::remove_file(dir.join(n));
         }

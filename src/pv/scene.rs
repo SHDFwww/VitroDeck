@@ -15,6 +15,10 @@
 //! - 舞台追光（[`Scene::Spotlight`]）：壓暗，兩盞燈慢慢擺、光束裡的微塵亮起來，關鍵字唱到時正上方淡淡打一道光。
 //! - 殘響（[`Scene::Echo`]）：關鍵字唱到後，空心的字從句子中心一層層往外擴散淡掉，底下一排對稱細柱跟拍子起伏。
 //!
+//! 文字PV_v2（[`Track::dense`]）要看得到前後句：本來每句都擺在畫面中間的那幾個（一般、跑馬燈、倒影、追光、殘響）
+//! 改成捲動（[`Track::rolls`]）：正在唱的在中間，上一句縮小退到上面、下一句小小地等在下面，換句時整排往上捲。
+//! 轉盤的下一句本來就在盤上、鐘擺的下一句先斜掛在它要甩進來的那邊、螺旋遠處的句子往外圈多拉開一點。
+//!
 //! 每段配哪個場景由 [`super::vary::cast`] 決定：副歌每次換、優先特殊場景，主歌稍微偏一般的（[`Scene::Plain`]），
 //! 相鄰兩段不同。[`Scene::persist`] 的那幾個場景，句子位置由這裡管（換句運鏡不動），
 //! 跟構圖一樣只看歌詞與曲目，是時間的純函數。`VITRO_PV_SCENE=depth` 這樣可以整首鎖定一個場景（實測用）。
@@ -151,6 +155,8 @@ pub struct Track {
     flip: bool,
     /// 分鏡：第 k 句用第 `order[k % 4]` 格
     order: [usize; 4],
+    /// 文字PV_v2：前後句要看得到（長卷排密一點、縱深左右錯開、階梯在下面先擺出下一句）
+    dense: bool,
     w: f32,
     h: f32,
 }
@@ -183,8 +189,8 @@ fn mid(ly: &Lyrics, i: usize) -> f32 {
     (cam::first_t(l) + sung_end(l, next_t(ly, i)).min(next_t(ly, i))) as f32 * 0.5
 }
 
-/// 每段的場景，跟 `segs` 一一對應
-pub fn tracks(ly: &Lyrics, segs: &[Segment], seed: u64, w: f32, h: f32) -> Vec<Track> {
+/// 每段的場景，跟 `segs` 一一對應。`dense` 是文字PV_v2（見 [`Track`]）
+pub fn tracks(ly: &Lyrics, segs: &[Segment], seed: u64, w: f32, h: f32, dense: bool) -> Vec<Track> {
     segs.iter()
         .enumerate()
         .map(|(si, s)| {
@@ -207,6 +213,7 @@ pub fn tracks(ly: &Lyrics, segs: &[Segment], seed: u64, w: f32, h: f32) -> Vec<T
                 spin: 0.0,
                 flip: rng.chance(0.5),
                 order: [0, 1, 2, 3],
+                dense,
                 w,
                 h,
             };
@@ -219,7 +226,11 @@ pub fn tracks(ly: &Lyrics, segs: &[Segment], seed: u64, w: f32, h: f32) -> Vec<T
                 Scene::Pendulum => pendulum(&mut tr, ly, &lines),
                 Scene::Cascade => cascade(&mut tr, ly, &lines, &mut rng),
                 Scene::Vortex => vortex(&mut tr, ly, &lines, &mut rng),
-                Scene::Plain | Scene::Marquee | Scene::Mirror | Scene::Spotlight | Scene::Echo => {}
+                Scene::Plain | Scene::Marquee | Scene::Mirror | Scene::Spotlight | Scene::Echo => {
+                    if dense {
+                        roll(&mut tr, ly, &lines);
+                    }
+                }
             }
             tr
         })
@@ -240,7 +251,8 @@ fn flight(tr: &mut Track, ly: &Lyrics, lines: &[usize], rng: &mut Rng) {
         let next = lines.get(k + 1).map_or(next_t(ly, i), |&n| cam::first_t(&ly.synced[n])) as f32;
         if k > 0 {
             head = (head + (r[0] - 0.5)).clamp(-0.55, 0.55);
-            let d = (0.82 + 0.1 * r[1]) * ((land - last) / 3000.0).clamp(0.75, 1.0);
+            // v2 走半個多畫面：上一句、下一句還留在畫面邊上
+            let d = (if tr.dense { 0.52 + 0.08 * r[1] } else { 0.82 + 0.1 * r[1] }) * ((land - last) / 3000.0).clamp(0.75, 1.0);
             p[0] += head.cos() * w * d;
             p[1] += head.sin() * h * d * 1.2;
             p[2] = (r[2] - 0.6) * 0.2;
@@ -273,7 +285,9 @@ fn depth(tr: &mut Track, ly: &Lyrics, lines: &[usize], rng: &mut Rng) {
         }
         prev = Some(t);
         let side = if k % 2 == 0 { side0 } else { -side0 };
-        let pose = Pose { s: 1.0, a: (r[2] - 0.5) * 0.1, x: side * w * (0.02 + 0.05 * r[0]), y: (r[1] - 0.5) * 0.08 * h };
+        // v2 左右錯開多一點：遠處等著的下一句不墊在正在唱的這句後面
+        let (sx, sy) = if tr.dense { (0.22 + 0.04 * r[0], 0.22) } else { (0.02 + 0.05 * r[0], 0.08) };
+        let pose = Pose { s: 1.0, a: (r[2] - 0.5) * 0.1, x: side * w * sx, y: (r[1] - 0.5) * sy * h };
         tr.keys.push(Key { t, p: [z - 1.0, 0.0, 0.0, 0.0], m: [0.0; 4] });
         tr.spots.push(Spot { line: i, pose, z, t: 0, dur: 0.0, gone: i64::MAX });
     }
@@ -401,6 +415,13 @@ fn cascade(tr: &mut Track, ly: &Lyrics, lines: &[usize], rng: &mut Rng) {
     }
 }
 
+/// 捲動（v2 的一般、跑馬燈、倒影、追光、殘響）：只記每句開始唱的時間，位置在 [`Track::shown`] 照捲到哪算
+fn roll(tr: &mut Track, ly: &Lyrics, lines: &[usize]) {
+    for &i in lines {
+        tr.spots.push(Spot { line: i, pose: Pose::ID, z: 0.0, t: cam::first_t(&ly.synced[i]), dur: 0.0, gone: i64::MAX });
+    }
+}
+
 /// 螺旋：跟縱深一樣一句比一句深、鏡頭往前飛，但句子排在一條螺旋上（每句轉將近 80°），
 /// 遠的新句從螺旋內圈斜斜地轉出來、到正中間時剛好轉正，舊句順著外圈轉出去
 fn vortex(tr: &mut Track, ly: &Lyrics, lines: &[usize], rng: &mut Rng) {
@@ -507,7 +528,9 @@ impl Track {
                 // 太近：失焦、淡掉；太遠：還看不清楚就先淡著
                 // 下一句出來的時候（大約 1.33 倍）開始淡，不跟新句疊太久
                 let alpha = (1.0 - smooth01((s - 1.3) / 0.55)) * smooth01((s - 0.2) / 0.2);
-                Shown { pose: Pose { s, a, x, y }, alpha, blur: (s - 1.2).max(0.0) * 7.0 }
+                // v2：遠處等著的句子對不到焦（景深）
+                let far = if self.dense { (0.85 - s).max(0.0) * 9.0 } else { 0.0 };
+                Shown { pose: Pose { s, a, x, y }, alpha, blur: (s - 1.2).max(0.0) * 7.0 + far }
             }
             Scene::Wall => {
                 if sp.t == i64::MAX {
@@ -535,9 +558,22 @@ impl Track {
                 Shown { pose: lerp_pose(a, sp.pose, u), alpha: (1.0 - 0.42 * u) * out, blur: 1.2 * u }
             }
             Scene::Pendulum => {
-                let (th, alpha, blur) = self.swing(sp, ms);
+                let (th, mut alpha, mut blur) = self.swing(sp, ms);
                 let l = h * ARM;
-                Shown { pose: Pose { s: 1.0, a: -th * 0.9, x: l * th.sin(), y: l * th.cos() - l }, alpha, blur }
+                let mut s = 1.0;
+                // v2：下一句先小小地斜掛在它要甩進來的那邊（就是甩進來的起點），甩進來時才放大。
+                // 同一邊的上上句還在甩出去，等它走了才出來
+                if self.dense {
+                    let u = ((ms - (sp.t - 150)) as f32 / 800.0).clamp(0.0, 1.0);
+                    s = 0.62 + 0.38 * smooth01(u * 1.5);
+                    if u <= 0.0 {
+                        let k = self.spots.iter().position(|o| o.line == i).unwrap_or(0);
+                        let free = k.checked_sub(2).map_or(i64::MIN / 2, |j| self.spots[j].gone + 350);
+                        alpha *= smooth01((ms - free) as f32 / 500.0);
+                        blur += 2.0;
+                    }
+                }
+                Shown { pose: Pose { s, a: -th * 0.9, x: l * th.sin(), y: l * th.cos() - l }, alpha, blur }
             }
             Scene::Cascade => {
                 let d = self.step_depth(i, ms);
@@ -545,9 +581,16 @@ impl Track {
                     return Some(Shown { pose: Pose::ID, alpha: 0.0, blur: 0.0 });
                 }
                 let wave = (ms as f32 / 240.0 - d * 0.9).sin() * 5.0 * d.min(1.0);
-                // 一階的高度要比一句（直書的也算）高，舊句才不會壓在新句上
-                let pose = Pose { s: 0.75f32.powf(d), a: self.spin * 0.02 * d, x: self.spin * w * 0.07 * d, y: h * 0.2 - h * 0.22 * d + wave };
+                // 一階的高度要比一句（直書的也算）高，舊句才不會壓在新句上。v2 整座往上移一點，下面留給下一句
+                let (front, step) = if self.dense { (0.1, 0.25) } else { (0.2, 0.22) };
+                let pose = Pose { s: 0.75f32.powf(d), a: self.spin * 0.02 * d, x: self.spin * w * 0.07 * d, y: h * front - h * step * d + wave };
                 let alpha = (1.0 - 0.2 * d).max(0.0) * (1.0 - smooth01((d - 2.6) / 0.8));
+                // v2：還沒輪到的句子小小地等在下面，輪到時跟舊句退一階同一個節奏升上來
+                let up = cam::glide((ms - (sp.t - 250)) as f32 / 520.0);
+                if self.dense && up < 1.0 {
+                    let wait = Pose { s: 0.6, a: -self.spin * 0.01, x: -self.spin * w * 0.04, y: h * 0.36 };
+                    return Some(Shown { pose: lerp_pose(wait, pose, up), alpha, blur: 2.0 * (1.0 - up) });
+                }
                 Shown { pose, alpha, blur: d * 1.5 }
             }
             Scene::Vortex => {
@@ -558,13 +601,52 @@ impl Track {
                 let s = 1.0 / dz;
                 // 對焦的那一刻（dz = 1）剛好在正中間、轉正；遠的在內圈、近的往外圈甩
                 let turn = (dz - 1.0) * 1.1 * self.spin;
-                let r = (dz - 1.0) * h * 0.3 * s;
+                // v2：遠處等著的下一句往外圈多拉開一點，不墊在正在唱的這句後面，而且對不到焦
+                let (spread, far) = if self.dense && dz > 1.0 { (0.7, (0.85 - s).max(0.0) * 9.0) } else { (0.3, 0.0) };
+                let r = (dz - 1.0) * h * spread * s;
                 let ang = sp.pose.a + turn;
                 let alpha = (1.0 - smooth01((s - 1.3) / 0.6)) * smooth01((s - 0.25) / 0.25);
-                Shown { pose: Pose { s, a: turn * 0.5, x: r * ang.cos(), y: r * ang.sin() }, alpha, blur: (s - 1.2).max(0.0) * 6.0 }
+                Shown { pose: Pose { s, a: turn * 0.5, x: r * ang.cos(), y: r * ang.sin() }, alpha, blur: (s - 1.2).max(0.0) * 6.0 + far }
             }
-            Scene::Plain | Scene::Marquee | Scene::Mirror | Scene::Spotlight | Scene::Echo => return None,
+            // 只有 v2 有 spot（[`roll`]），一般的照換句運鏡，上面 `spot` 就回 None 了
+            Scene::Plain | Scene::Marquee | Scene::Mirror | Scene::Spotlight | Scene::Echo => {
+                // o：0 是正在唱、1 是上一句、-1 是下一句，換句時連續地捲過去
+                let o = self.rolled(i, ms);
+                let ao = o.abs();
+                // 倒影整排收到水面上，縮小一點；跑馬燈的帶子在上下緣，前後句往中間收
+                let (y0, s0, gap) = match self.scene {
+                    Scene::Mirror => (-h * 0.08, 0.86, 0.27),
+                    Scene::Marquee => (0.0, 1.0, 0.24),
+                    _ => (0.0, 1.0, 0.3),
+                };
+                // 前後句輪流稍微偏左、偏右，不排成死板的一直條
+                let k = self.spots.iter().position(|o| o.line == i).unwrap_or(0);
+                let side = if k % 2 == 0 { 1.0 } else { -1.0 };
+                let near = smooth01(ao);
+                let pose = Pose { s: s0 * (1.0 - 0.42 * near), a: 0.0, x: side * w * 0.05 * near, y: y0 - o * gap * h * s0 };
+                let alpha = 1.0 - smooth01((ao - 1.15) / 0.5);
+                Shown { pose, alpha, blur: 1.6 * ao.min(2.0) }
+            }
         })
+    }
+
+    /// v2 的一般場景改成捲動（[`roll`]），句子位置歸場景管
+    pub fn rolls(&self) -> bool {
+        self.dense && matches!(self.scene, Scene::Plain | Scene::Marquee | Scene::Mirror | Scene::Spotlight | Scene::Echo)
+    }
+
+    /// 句子留到段落結束才退場、位置由場景管（[`Scene::persist`]，加上 v2 的捲動）
+    pub fn persist(&self) -> bool {
+        self.scene.persist() || self.rolls()
+    }
+
+    /// 捲動：第 `i` 句離正在唱的那句幾句（唱過的是正的），每句開始唱時平滑地捲一格
+    fn rolled(&self, i: usize, ms: i64) -> f32 {
+        let Ok(k) = self.spots.binary_search_by_key(&i, |s| s.line) else { return 0.0 };
+        let started: f32 = self.spots.iter().map(|o| cam::glide((ms - (o.t - 250)) as f32 / 520.0)).sum();
+        // 下一段開始時這段的最後一句也往上捲一格，讓出中間給下一段的第一句
+        let handoff = cam::glide((ms - (self.next - 250)) as f32 / 520.0);
+        started + handoff - (k + 1) as f32
     }
 
     /// 不歸場景管的句子，照換句運鏡擺好之後再整個搬一次：倒影把句子往上收，留下半部當水面
@@ -630,7 +712,7 @@ pub(super) fn back(
     if k <= 0.003 {
         return;
     }
-    let st = style_at(segs, si);
+    let st = style_at(segs, si).painted(accent);
     let accent = st.accent(accent);
     match tr.scene {
         Scene::Flight => dust(out, tr, k, ms, beat, accent),
@@ -778,7 +860,8 @@ fn trays(out: &mut Vec<Inst>, tr: &Track, st: &Style, lines: &HashMap<usize, PvL
         let d = tr.step_depth(sp.line, ms);
         let (x, y) = s.pose.map(l.lay.cx, l.lay.cy, c);
         let glow = 0.5 + 0.5 * (ms as f32 / 400.0 - d * 1.2).sin();
-        let mut f = Inst::rect(x, y, w * 0.66 * s.pose.s, h * 0.22 * s.pose.s, s.pose.a, with_a(st.line, (0.06 + 0.08 * glow) * s.alpha * k));
+        let a = (0.06 + 0.08 * glow) * if tr.dense { 0.6 } else { 1.0 };
+        let mut f = Inst::rect(x, y, w * 0.66 * s.pose.s, h * 0.22 * s.pose.s, s.pose.a, with_a(st.line, a * s.alpha * k));
         f.fx[2] = 0.0;
         f.line = [st.line[0], st.line[1], st.line[2], 1.2];
         out.push(f);
@@ -903,7 +986,8 @@ fn tunnel(out: &mut Vec<Inst>, tr: &Track, st: &Style, k: f32, ms: i64, beat: &B
             continue;
         }
         let s = 1.0 / dz;
-        let a = k * 0.14 * smooth01((s - 0.18) / 0.3) * (1.0 - smooth01((s - 1.0) / 0.5)) * (1.0 + 0.3 * beat.env);
+        // v2 畫面上已經有前後句，框淡一半
+        let a = k * if tr.dense { 0.07 } else { 0.14 } * smooth01((s - 0.18) / 0.3) * (1.0 - smooth01((s - 1.0) / 0.5)) * (1.0 + 0.3 * beat.env);
         if a <= 0.003 {
             continue;
         }
@@ -1045,13 +1129,13 @@ mod tests {
     }
 
     fn seg(scene: Scene) -> Vec<Segment> {
-        vec![Segment { first: 0, t: 1000, look: Look::Neon, chorus: true, scene, hue: 0.0 }]
+        vec![Segment { first: 0, t: 1000, look: Look::Neon, chorus: true, scene, hue: 0.0, v2: false }]
     }
 
     #[test]
     fn 飛越鏡頭一直在動而且唱的時候句子在中間() {
         let ly = song(5);
-        let tr = &tracks(&ly, &seg(Scene::Flight), 3, 1920.0, 1080.0)[0];
+        let tr = &tracks(&ly, &seg(Scene::Flight), 3, 1920.0, 1080.0, false)[0];
         // 唱的時候只在中間附近漂
         let land = cam::first_t(&ly.synced[2]);
         for t in [land, land + 1200, land + 2400] {
@@ -1073,7 +1157,7 @@ mod tests {
     #[test]
     fn 縱深新句由小變大舊句飛過去淡掉() {
         let ly = song(4);
-        let tr = &tracks(&ly, &seg(Scene::Depth), 3, 1920.0, 1080.0)[0];
+        let tr = &tracks(&ly, &seg(Scene::Depth), 3, 1920.0, 1080.0, false)[0];
         let land = cam::first_t(&ly.synced[2]);
         let new = tr.shown(2, land).unwrap();
         assert!(new.pose.s < 0.95 && new.alpha > 0.5, "{new:?}");
@@ -1087,7 +1171,7 @@ mod tests {
     #[test]
     fn 堆疊牆舊句收到格子裡最後一句留在原位() {
         let ly = song(4);
-        let tr = &tracks(&ly, &seg(Scene::Wall), 3, 1920.0, 1080.0)[0];
+        let tr = &tracks(&ly, &seg(Scene::Wall), 3, 1920.0, 1080.0, false)[0];
         let after = cam::first_t(&ly.synced[3]) + 1000;
         for i in 0..3 {
             let s = tr.shown(i, after).unwrap();
@@ -1103,7 +1187,7 @@ mod tests {
     fn 轉盤唱的時候句子在正中間舊句轉到旁邊() {
         let ly = song(5);
         for seed in 0..8 {
-            let tr = &tracks(&ly, &seg(Scene::Carousel), seed, 1920.0, 1080.0)[0];
+            let tr = &tracks(&ly, &seg(Scene::Carousel), seed, 1920.0, 1080.0, false)[0];
             let land = cam::first_t(&ly.synced[2]);
             for t in [land, land + 1000, land + 2000] {
                 let s = tr.shown(2, t).unwrap();
@@ -1118,7 +1202,7 @@ mod tests {
     #[test]
     fn 分鏡舊句收進格子第五句來時讓位() {
         let ly = song(6);
-        let tr = &tracks(&ly, &seg(Scene::Split), 3, 1920.0, 1080.0)[0];
+        let tr = &tracks(&ly, &seg(Scene::Split), 3, 1920.0, 1080.0, false)[0];
         let at = |i: usize| cam::first_t(&ly.synced[i]);
         let s = tr.shown(0, at(0) + 500).unwrap();
         assert!(s.pose.s > 0.8, "{s:?}");
@@ -1133,7 +1217,7 @@ mod tests {
     #[test]
     fn 鐘擺甩進來停在中間再往來的方向甩出去() {
         let ly = song(4);
-        let tr = &tracks(&ly, &seg(Scene::Pendulum), 3, 1920.0, 1080.0)[0];
+        let tr = &tracks(&ly, &seg(Scene::Pendulum), 3, 1920.0, 1080.0, false)[0];
         let at = |i: usize| cam::first_t(&ly.synced[i]);
         let a = tr.shown(1, at(1) - 100).unwrap().pose;
         let b = tr.shown(1, at(1) + 1500).unwrap().pose;
@@ -1149,7 +1233,7 @@ mod tests {
     #[test]
     fn 階梯舊句一階一階往上退() {
         let ly = song(7);
-        let tr = &tracks(&ly, &seg(Scene::Cascade), 3, 1920.0, 1080.0)[0];
+        let tr = &tracks(&ly, &seg(Scene::Cascade), 3, 1920.0, 1080.0, false)[0];
         let t = cam::first_t(&ly.synced[6]) + 800;
         let ys: Vec<f32> = (4..7).map(|i| tr.shown(i, t).unwrap().pose.y).collect();
         assert!(ys.windows(2).all(|w| w[0] < w[1]), "{ys:?}");
@@ -1161,7 +1245,7 @@ mod tests {
     #[test]
     fn 螺旋對焦時在正中間() {
         let ly = song(5);
-        let tr = &tracks(&ly, &seg(Scene::Vortex), 3, 1920.0, 1080.0)[0];
+        let tr = &tracks(&ly, &seg(Scene::Vortex), 3, 1920.0, 1080.0, false)[0];
         // 對焦的時刻（唱到一半）在正中間、轉正
         let i = 2;
         let s = tr.shown(i, mid(&ly, i) as i64).unwrap();

@@ -290,7 +290,7 @@ mod tests {
     const BR: &[&str] = &["安靜一下", "聽見遠方的海浪", "風吹過我們的屋頂", "星星一顆一顆亮起來"];
 
     fn plan(ly: &Lyrics, seed: u64, force: Option<Look>) -> super::super::plan::Plan {
-        super::super::plan::Plan::build(ly, seed, force, 1920.0, 1080.0)
+        super::super::plan::Plan::build(ly, seed, force, 1920.0, 1080.0, false)
     }
 
     #[test]

@@ -70,7 +70,7 @@ pub fn spin3(c: [f32; 3], deg: f32) -> [f32; 3] {
 }
 
 /// 亮度、彩度、色相（弧度）組回 sRGB；放不進色域就收彩度
-fn lch(l: f32, ch: f32, h: f32) -> [f32; 3] {
+pub fn lch(l: f32, ch: f32, h: f32) -> [f32; 3] {
     let at = |k: f32| unlab([l, ch * k * h.cos(), ch * k * h.sin()]);
     let inside = |v: [f32; 3]| v.iter().all(|&x| (-1e-4..=1.0 + 1e-4).contains(&x));
     let mut v = at(1.0);

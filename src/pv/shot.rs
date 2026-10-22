@@ -11,6 +11,10 @@
 //! `VITRO_PV_SCENE=depth`（plain／flight／depth／marquee／wall／carousel／mirror／split／pendulum／cascade／vortex／spotlight／echo）整首鎖定一種段落場景（正式執行也認）。
 //! `VITRO_PV_INTRO=毫秒` 把整份歌詞往後推（拉長前奏）、`VITRO_PV_BREAK=毫秒` 在第 8 句後面多空一段間奏，看沒字時的流光。
 //! `VITRO_PV_MIX=進,退`（毫秒，退可省略）：在那個時間點從一般歌詞頁換進 PV、再退回去，看進出的轉場。
+//! `VITRO_PV_SWAP=切,到`（毫秒，v2）：在「切」切到第二首（從頭開始、歌詞還沒到，只演曲名卡），「到」歌詞到了，看換歌接著演。
+//! `VITRO_PV_V2=1` 拍文字PV_v2。`VITRO_FONT`、`VITRO_FONT_LATIN`、`VITRO_FONT_SCALE` 換字型（同 `--shot` 其他場景）。
+//! `VITRO_TRANS=1` 打開「顯示翻譯」（示範歌詞每句都有自己寫的翻譯）。示範曲在最後一句後面留 15 秒尾奏（看片尾曲名卡）。
+//! `VITRO_PV_GEO=1` 打開 v2 的背景幾何圖形（五個頻段照錄音量到的大小假造，每拍跳一下）。
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -30,6 +34,12 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
         let rgb = [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff].map(|x| x as f32 / 255.0);
         crate::theme::set_accent(Some(crate::theme::accent_from(rgb, 0.8)));
     }
+    crate::text::set_font(
+        &std::env::var("VITRO_FONT_LATIN").unwrap_or_default(),
+        &std::env::var("VITRO_FONT").unwrap_or_default(),
+        std::env::var("VITRO_FONT_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+    );
+    let v2 = std::env::var_os("VITRO_PV_V2").is_some();
     let gpu = Gpu::headless()?;
     println!("GPU: {}", gpu.adapter_name);
     let target = Offscreen::new(&gpu.device, width, height);
@@ -46,7 +56,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
     };
     let (ly, loud) = demo();
     let flat = std::env::var_os("VITRO_PV_FLAT").is_some();
-    let dur = ly.synced.last().map_or(60_000, |l| l.t + 6000);
+    let dur = ly.synced.last().map_or(60_000, |l| l.t + 15_000);
     let chrome: f32 = std::env::var("VITRO_CHROME").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let beats = std::env::var_os("VITRO_PV_NOBEAT").is_none();
     let look = std::env::var("VITRO_PV_LOOK").ok().and_then(|v| {
@@ -56,9 +66,17 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
         let mut it = v.split(',').filter_map(|x| x.trim().parse::<i64>().ok());
         Some((it.next()?, it.next()))
     });
+    // 切歌接著演（v2）：在 a 切到第二首（從頭開始、歌詞還沒到），b 歌詞到（同一份示範歌詞）
+    let swap = std::env::var("VITRO_PV_SWAP").ok().and_then(|v| {
+        let mut it = v.split(',').filter_map(|x| x.trim().parse::<i64>().ok());
+        let a = it.next()?;
+        Some((a, it.next().unwrap_or(i64::MAX).max(a)))
+    });
+    let empty = Lyrics::default();
     let base = Instant::now();
 
-    let mut frame = |ms: i64, out: &Path| -> anyhow::Result<()> {
+    // `next` 是下一幀的時間：切歌、歌詞到的前一幀要先存起來（正式執行時 main.rs 也是這樣）
+    let mut frame = |ms: i64, next: Option<i64>, out: &Path| -> anyhow::Result<()> {
         glass.settle(&gpu);
         glass.end_frame();
         let now = crate::scene_now::Now {
@@ -74,7 +92,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             shuffle: false,
             repeat: crate::smtc::Repeat::Off,
             ktv: true,
-            show_trans: false,
+            show_trans: std::env::var_os("VITRO_TRANS").is_some(),
             tools: crate::ui::Tools { liked: Some(false), volume: Some(62), vol_locked: false },
             vol_drag: false,
             vinyl: None,
@@ -85,10 +103,15 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             fx: Default::default(),
         };
         let at = base + Duration::from_millis(ms.max(0) as u64);
-        let mut pulse = if beats { fake_pulse(base, ms) } else { Default::default() };
+        let (track, pv_ly, sms, title, artist) = match swap {
+            Some((a, b)) if ms >= a => ("demo2", if ms >= b { &ly } else { &empty }, ms - a, "第二首歌", "VitroDeck 示範二"),
+            _ => ("demo", &ly, ms, "霓虹之夜", "VitroDeck 示範"),
+        };
+        let freeze = swap.zip(next).is_some_and(|((a, b), n)| (ms < a && n >= a) || (ms < b && n >= b));
+        let mut pulse = if beats { fake_pulse(base, sms) } else { Default::default() };
         if !flat {
             // 最近一秒的平均（真的響度也是平滑過的）
-            pulse.energy = (0..5).map(|j| loud(ms - j * 250)).sum::<f32>() / 5.0;
+            pulse.energy = (0..5).map(|j| loud(sms - j * 250)).sum::<f32>() / 5.0;
             pulse.energy_conf = 0.9;
         }
         // 從一般歌詞頁換進來、退回去的進度
@@ -106,7 +129,25 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             &now,
             chrome,
             None,
-            Some(crate::scene_now::PvIn { pv: &mut pv, lyrics: &ly, ms, mix, track: "demo", pulse, now: at, chrome, look }),
+            Some(crate::scene_now::PvIn {
+                pv: &mut pv,
+                lyrics: pv_ly,
+                ms: sms,
+                mix,
+                track,
+                pulse,
+                now: at,
+                chrome,
+                look,
+                v2,
+                title,
+                artist,
+                duration: dur,
+                spec: fake_spec(sms),
+                geo: std::env::var_os("VITRO_PV_GEO").is_some(),
+                bands: fake_bands(sms),
+                freeze,
+            }),
         )?;
         target.save_png(&gpu, out)?;
         text.end_frame();
@@ -125,15 +166,33 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
         let n = ((to - from) * fps / 1000).max(1);
         let t0 = Instant::now();
         for f in 0..n {
-            frame(from + f * 1000 / fps, &path.join(format!("{f:05}.png")))?;
+            frame(from + f * 1000 / fps, Some(from + (f + 1) * 1000 / fps), &path.join(format!("{f:05}.png")))?;
         }
         println!("寫出 {n} 幀到 {}（{:.1} 秒）", path.display(), t0.elapsed().as_secs_f32());
         return Ok(());
     }
     let ms = std::env::var("VITRO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(9_500);
-    frame(ms, path)?;
+    frame(ms, None, path)?;
     println!("寫出 {} 場景=文字PV {ms}ms", path.display());
     Ok(())
+}
+
+/// 假造的頻譜（給 v2 間奏的光帶）：低頻高、高頻低，各段跟著時間起伏
+fn fake_spec(ms: i64) -> [f32; super::idle::SPEC] {
+    std::array::from_fn(|j| {
+        let f = j as f32 / super::idle::SPEC as f32;
+        let wob = ((ms as f32 / 170.0 + j as f32 * 0.9).sin() * 0.5 + 0.5) * ((ms as f32 / 410.0 - j as f32 * 0.4).cos() * 0.25 + 0.75);
+        (0.8 - 0.55 * f) * (0.45 + 0.55 * wob)
+    })
+}
+
+/// 假造的五個頻段（給 v2 的背景幾何）：大小照錄音量到的中位數，每拍低音、反拍高音各跳一下
+fn fake_bands(ms: i64) -> [f32; 5] {
+    let on = if ms >= FIRST { 1.0 } else { 0.0 };
+    let since = |t0: i64| (ms - t0).rem_euclid(BEAT) as f32;
+    let kick = on * (-since(FIRST) / 120.0).exp();
+    let hat = on * (-since(FIRST + BEAT / 2) / 80.0).exp();
+    [0.72 + 0.12 * kick, 0.72 + 0.05 * kick, 0.62, 0.52 + 0.03 * hat, 0.33 + 0.1 * hat]
 }
 
 /// 照 100 BPM 假造的節拍：每拍都有鼓點，小節第一拍重
@@ -171,6 +230,28 @@ fn demo() -> (Lyrics, impl Fn(i64) -> f32) {
     add(&["燃燒吧 燃燒吧", "把影子 甩在身後"], 0.6, true);
     add(&CHORUS, 0.95, true);
     add(&["直到 世界盡頭", "再見 了"], 0.25, false);
+    // 自己寫的翻譯（`VITRO_TRANS=1` 才看得到）：中文句配英文、英文句配中文
+    let trans = |s: &str| -> Option<&'static str> {
+        Some(match s {
+            "霓虹在雨裡慢慢融化" => "Neon slowly melting in the rain",
+            "我們在午夜 奔跑" => "We run through the midnight",
+            "心跳 比節拍還快" => "A heartbeat faster than the beat",
+            "Don't let the city sleep" => "別讓這座城市睡去",
+            "把今晚 唱到最後一秒" => "Sing tonight to the very last second",
+            "就算明天 會忘記" => "Even if tomorrow we forget",
+            "此刻 閃耀吧！" => "Shine, right now",
+            "Light it up tonight" => "今晚把它點亮",
+            "風吹過 空蕩的月台" => "Wind across the empty platform",
+            "末班車 載走了夏天" => "The last train took the summer away",
+            "還沒說出口的 那句話" => "The words still left unsaid",
+            "Say it before the dawn" => "在天亮之前說出口",
+            "燃燒吧 燃燒吧" => "Burn, keep burning",
+            "把影子 甩在身後" => "Leave the shadows behind",
+            "直到 世界盡頭" => "Until the end of the world",
+            "再見 了" => "Goodbye",
+            _ => return None,
+        })
+    };
     let half = BEAT / 2;
     let ms_env = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
     let (intro, brk) = (ms_env("VITRO_PV_INTRO"), ms_env("VITRO_PV_BREAK"));
@@ -202,7 +283,7 @@ fn demo() -> (Lyrics, impl Fn(i64) -> f32) {
                     t += d;
                 }
             }
-            Line { t: t0, text: s.to_string(), words: (k != 5).then_some(words), ..Default::default() }
+            Line { t: t0, text: s.to_string(), words: (k != 5).then_some(words), trans: trans(s).map(Into::into), ..Default::default() }
         })
         .collect();
     let times: Vec<(i64, f32)> = synced.iter().zip(&lines).map(|(l, x)| (l.t, x.1)).collect();

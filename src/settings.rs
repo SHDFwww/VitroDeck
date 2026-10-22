@@ -65,10 +65,18 @@ pub enum Item {
     UiScale,
     /// 歌詞頁的文字 PV（實驗中，歌詞頁按 P 也能切）。只在設定視窗
     LyricsPv,
+    /// 文字 PV 的第二版做法（實驗中）。只在設定視窗，而且文字 PV 開著才出現
+    LyricsPvV2,
+    /// v2 的背景幾何圖形（實驗中）。只在設定視窗，而且文字 PV 與 v2 都開著才出現
+    LyricsPvGeo,
     /// 播放時聽歌聲自動校正歌詞時間、抓配錯歌的歌詞（`align/`）。只在設定視窗
     LyricsAutoalign,
     /// 主視窗的畫面更新率上限。只在設定視窗
     FpsLimit,
+    /// 工作列按鈕上的播放進度。只在設定視窗
+    TaskbarProgress,
+    /// 工作列按鈕上的字換成「歌手 - 歌名」。只在設定視窗
+    TaskbarTitle,
 }
 
 /// 字型大小與介面大小的滑桿：一格 5%，80%～150%
@@ -165,47 +173,31 @@ impl Item {
             Item::DataDir => "設定檔",
             Item::About => "關於",
             Item::Appearance => "外觀",
-            Item::AccentFollow => "強調色跟著封面",
+            Item::AccentFollow => "強調色隨封面",
             Item::FontCjk => "中文字型",
             Item::FontLatin => "英文字型",
             Item::FontScale => "字型大小",
             Item::UiScale => "介面大小",
             Item::LyricsPv => "文字 PV",
+            Item::LyricsPvV2 => "文字PV_v2",
+            Item::LyricsPvGeo => "背景幾何圖形",
             Item::LyricsAutoalign => "自動對齊歌詞",
             Item::FpsLimit => "畫面更新率上限",
+            Item::TaskbarProgress => "工作列顯示播放進度",
+            Item::TaskbarTitle => "工作列顯示歌手與歌名",
         }
     }
 
     /// 這一列的說明。只有值看不出在做什麼的才寫。
     pub fn hint(self) -> &'static str {
         match self {
-            Item::F11One => "關掉時 F11 不會停在單一螢幕的全螢幕",
-            Item::F11Span => "關掉時 F11 只在視窗與全螢幕之間切換",
-            Item::Vinyl => "歌詞頁的專輯圖畫成黑膠唱片，關掉就是方形封面",
-            Item::VinylRpm => "3 rpm 是 20 秒一圈；真實唱盤是 33⅓ 或 45",
-            Item::Ktv => "封面流時在頂端顯示當前句",
-            Item::MiniEnabled => "封面、曲名、歌手與進度；點封面回到這裡",
-            Item::MiniLocked => "固定在最上層、滑鼠穿透；鎖定後只能在這裡或系統列解鎖",
-            Item::MiniLyrics => "歌手移到歌名後面，空出來的位置放當前句與下一句",
-            Item::MiniRecall => "移到主螢幕右下角，大小不變；沒開的話順便打開",
-            Item::CloseToTray => "關掉主視窗後只留右下角圖示，畫面與歌詞停下來；右鍵圖示可結束",
+            Item::VinylRpm => "預設 3 rpm",
             Item::VizEnabled => "關掉時 Tab 只在封面流與歌詞之間切換",
             Item::VizShaders => "關掉只剩網格變形，幾乎整片灰",
             Item::VizFps => "MilkDrop 是按幀推進的，不限的話在高刷新率螢幕上會快好幾倍",
-            Item::LyricsOffset => "歌詞比音樂早就調正的",
-            Item::LyricsTraditional => "歌詞，以及曲名、歌手、專輯與播放清單的名稱",
-            Item::Refresh => "重新抓一次你的專輯與播放清單",
             Item::UpdateCheck => "只問 GitHub 有沒有新版，不會自己裝",
             Item::SpotifyStatus => "還沒有 client_id 的話，按一下開設定精靈",
-            Item::Appearance => "迷你視窗與視覺效果頁固定深色",
-            Item::AccentFollow => "開關、滑桿與主要按鈕的顏色取自正在播的封面；關掉是 Spotify 綠",
-            Item::FontCjk => "漢字、注音、假名與全形標點",
-            Item::FontLatin => "英文、數字與半形標點",
-            Item::FontScale => "手寫體這類偏小的字型可調大",
-            Item::UiScale => "迷你視窗不跟著變",
-            Item::LyricsAutoalign => "聽播放的聲音校正歌詞時間、換掉配錯歌的歌詞；第一次會下載 36 MB 模型。關掉後量過的校正也不套用",
-            Item::LyricsPv => "全螢幕跟著節拍演出，限有逐字歌詞的歌；歌詞頁按 P 也能切換",
-            Item::FpsLimit => "取螢幕更新率能整除的值，例如 180 Hz 選 120 是 90 fps；視覺效果頁照它自己的上限",
+            Item::LyricsAutoalign => "首次使用需下載約 36MB 模型",
             _ => "",
         }
     }
@@ -214,7 +206,7 @@ impl Item {
     pub fn badge(self) -> &'static str {
         match self {
             Item::Appearance => "淺色實驗中",
-            Item::LyricsPv => "實驗中",
+            Item::LyricsPv | Item::LyricsPvV2 | Item::LyricsPvGeo => "實驗中",
             _ => "",
         }
     }
@@ -243,6 +235,8 @@ impl Item {
             Item::LyricsTraditional => on_off(cfg.lyrics_traditional),
             Item::Ktv => on_off(cfg.ktv),
             Item::LyricsPv => on_off(cfg.lyrics_pv),
+            Item::LyricsPvV2 => on_off(cfg.lyrics_pv_v2),
+            Item::LyricsPvGeo => on_off(cfg.lyrics_pv_geo),
             Item::LyricsAutoalign => on_off(cfg.lyrics_autoalign),
             Item::Vinyl => on_off(cfg.vinyl),
             Item::VinylRpm => rpm_label(cfg.vinyl_rpm),
@@ -288,6 +282,8 @@ impl Item {
             Item::UiScale => format!("{:.0}%", cfg.ui_scale * 100.0),
             Item::FpsLimit if cfg.fps_limit == 0 => "跟隨螢幕".into(),
             Item::FpsLimit => format!("{} fps", cfg.fps_limit),
+            Item::TaskbarProgress => on_off(cfg.taskbar_progress),
+            Item::TaskbarTitle => on_off(cfg.taskbar_title),
         }
     }
 
@@ -329,6 +325,8 @@ impl Item {
             Item::LyricsTraditional => cfg.lyrics_traditional = !cfg.lyrics_traditional,
             Item::Ktv => cfg.ktv = !cfg.ktv,
             Item::LyricsPv => cfg.lyrics_pv = !cfg.lyrics_pv,
+            Item::LyricsPvV2 => cfg.lyrics_pv_v2 = !cfg.lyrics_pv_v2,
+            Item::LyricsPvGeo => cfg.lyrics_pv_geo = !cfg.lyrics_pv_geo,
             Item::LyricsAutoalign => cfg.lyrics_autoalign = !cfg.lyrics_autoalign,
             Item::Vinyl => cfg.vinyl = !cfg.vinyl,
             Item::VinylRpm => {
@@ -345,6 +343,8 @@ impl Item {
             Item::MiniLocked => cfg.mini_locked = !cfg.mini_locked,
             Item::MiniLyrics => cfg.mini_lyrics = !cfg.mini_lyrics,
             Item::CloseToTray => cfg.close_to_tray = !cfg.close_to_tray,
+            Item::TaskbarProgress => cfg.taskbar_progress = !cfg.taskbar_progress,
+            Item::TaskbarTitle => cfg.taskbar_title = !cfg.taskbar_title,
             Item::VizEnabled => cfg.viz_enabled = !cfg.viz_enabled,
             Item::VizFps => {
                 const STEPS: [u32; 4] = [30, 60, 120, 0];
@@ -417,12 +417,16 @@ impl Item {
             Item::LyricsTraditional => cfg.lyrics_traditional,
             Item::Ktv => cfg.ktv,
             Item::LyricsPv => cfg.lyrics_pv,
+            Item::LyricsPvV2 => cfg.lyrics_pv_v2,
+            Item::LyricsPvGeo => cfg.lyrics_pv_geo,
             Item::LyricsAutoalign => cfg.lyrics_autoalign,
             Item::Vinyl => cfg.vinyl,
             Item::MiniEnabled => cfg.mini_enabled,
             Item::MiniLocked => cfg.mini_locked,
             Item::MiniLyrics => cfg.mini_lyrics,
             Item::CloseToTray => cfg.close_to_tray,
+            Item::TaskbarProgress => cfg.taskbar_progress,
+            Item::TaskbarTitle => cfg.taskbar_title,
             Item::VizEnabled => cfg.viz_enabled,
             Item::VizShaders => cfg.viz_preset_shaders,
             Item::UpdateCheck => cfg.update_check,
@@ -527,6 +531,15 @@ impl Item {
         }
     }
 
+    /// 現在不顯示的列（不是停用：整列不畫、鍵盤也走不到）。只跟著別的開關才有意義的選項
+    pub fn hidden(self, cfg: &Config) -> bool {
+        match self {
+            Item::LyricsPvV2 => !cfg.lyrics_pv,
+            Item::LyricsPvGeo => !(cfg.lyrics_pv && cfg.lyrics_pv_v2),
+            _ => false,
+        }
+    }
+
     /// 改一個值。設定視窗與鍵盤都經過這裡
     pub fn apply(self, cfg: &mut Config, e: Edit) {
         match e {
@@ -614,12 +627,12 @@ impl Page {
             Page::Account => &[("帳號", &[I::SpotifyStatus]), ("播放", &[I::Device, I::Refresh])],
             Page::Display => &[
                 ("封面流", &[I::Sort, I::CoverScale]),
-                ("視窗", &[I::StartFullscreen, I::Screen, I::F11One, I::F11Span, I::CloseToTray]),
+                ("視窗", &[I::StartFullscreen, I::Screen, I::F11One, I::F11Span, I::CloseToTray, I::TaskbarProgress, I::TaskbarTitle]),
                 ("文字與大小", &[I::FontCjk, I::FontLatin, I::FontScale, I::UiScale]),
                 ("顏色", &[I::Appearance, I::AccentFollow]),
-                ("耗電", &[I::FpsLimit]),
+                ("進階", &[I::FpsLimit]),
             ],
-            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsAutoalign, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv])],
+            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsAutoalign, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv, I::LyricsPvV2, I::LyricsPvGeo])],
             Page::Vinyl => &[("", &[I::Vinyl, I::VinylRpm])],
             Page::Mini => &[("", &[I::MiniEnabled, I::MiniLocked, I::MiniLyrics, I::MiniRecall])],
             Page::Viz => &[("", &[I::VizEnabled]), ("MilkDrop", &[I::VizFps, I::VizCategory, I::VizShaders])],
@@ -662,7 +675,7 @@ mod tests {
         for it in ITEMS {
             assert_eq!(all.iter().filter(|x| *x == it).count(), 1, "{it:?}");
         }
-        assert_eq!(all.len(), ITEMS.len() + 10, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV、自動對齊與更新率上限");
+        assert_eq!(all.len(), ITEMS.len() + 14, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV 三列、自動對齊、更新率上限與工作列的進度、曲名");
     }
 
     #[test]
