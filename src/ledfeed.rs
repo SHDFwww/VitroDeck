@@ -1,14 +1,19 @@
-//! 燈條（SkydimoBloom）的音量回報 —— Python 版 `audiofeed.py` 的 UDP 那一半。
+//! 燈條（SkydimoBloom）的音量回報 —— Python 版 `audiofeed.py` 的 UDP 那一半，
+//! 外加文字 PV 的追光（[`crate::ledglow`]）。
 //!
-//! 協定只走 127.0.0.1:[`PORT`]，跟 Python 版逐 byte 相同：
+//! 協定只走 127.0.0.1:[`PORT`]，音量那段跟 Python 版逐 byte 相同：
 //!
 //! ```text
-//! SkydimoBloom → 這裡   b"SKY1"                          每秒一次，當作訂閱
+//! SkydimoBloom → 這裡   b"SKY1"                          每秒一次，當作訂閱音量
 //! 這裡 → SkydimoBloom   pack("<4sBf", b"VDL1", playing, rms)
 //!                       收到訂閱時回一包，擷取中每 1024 個取樣送一包
+//! SkydimoBloom → 這裡   b"SKYE"                          每秒一次，當作訂閱追光
+//! 這裡 → SkydimoBloom   b"VDE1" + 四邊的顏色（格式見 `ledglow::packet`）
+//!                       PV 演著、視窗在前景時最多每 15 ms 一包
+//!                       b"VDE0"                          不演了
 //! ```
 //!
-//! 超過 [`TTL`] 沒收到訂閱就當作退訂。拾音只看**本機**在播（SMTC）——
+//! 兩種訂閱分開記：只要追光的話不必開音訊擷取。超過 [`TTL`] 沒收到訂閱就當作退訂。拾音只看**本機**在播（SMTC）——
 //! Spotify 放在別台裝置時 loopback 根本抓不到聲音。
 //!
 //! 全域一份：poller（播放狀態）、音訊擷取（RMS）、這裡的收訊執行緒三邊都要碰，
@@ -27,6 +32,8 @@ struct Led {
     sock: UdpSocket,
     /// 訂閱者與到期時刻
     sub: Mutex<Option<(SocketAddr, Instant)>>,
+    /// 追光的訂閱者與到期時刻
+    glow: Mutex<Option<(SocketAddr, Instant)>>,
     playing: AtomicBool,
     last_rms: Mutex<f32>,
 }
@@ -46,7 +53,7 @@ pub fn packet(playing: bool, rms: f32) -> [u8; 9] {
 pub fn start() -> Result<(), String> {
     let sock = UdpSocket::bind(("127.0.0.1", PORT)).map_err(|e| e.to_string())?;
     let recv = sock.try_clone().map_err(|e| e.to_string())?;
-    let led = Led { sock, sub: Mutex::new(None), playing: AtomicBool::new(false), last_rms: Mutex::new(0.0) };
+    let led = Led { sock, sub: Mutex::new(None), glow: Mutex::new(None), playing: AtomicBool::new(false), last_rms: Mutex::new(0.0) };
     if LED.set(led).is_err() {
         return Err("已經啟動過".into());
     }
@@ -62,6 +69,11 @@ pub fn start() -> Result<(), String> {
                         let playing = led.playing.load(Ordering::Relaxed);
                         let rms = if playing { *led.last_rms.lock().unwrap() } else { 0.0 };
                         let _ = led.sock.send_to(&packet(playing, rms), addr);
+                    }
+                    Ok((n, addr)) if buf[..n].starts_with(b"SKYE") => {
+                        if let Some(led) = LED.get() {
+                            *led.glow.lock().unwrap() = Some((addr, Instant::now() + TTL));
+                        }
                     }
                     Ok(_) => {}
                     // 燈條那頭關掉後，Windows 會把 ICMP port unreachable 回報成
@@ -79,7 +91,32 @@ pub fn start() -> Result<(), String> {
 }
 
 fn subscriber(led: &Led) -> Option<SocketAddr> {
-    led.sub.lock().unwrap().filter(|(_, until)| Instant::now() < *until).map(|(a, _)| a)
+    alive(&led.sub)
+}
+
+fn alive(sub: &Mutex<Option<(SocketAddr, Instant)>>) -> Option<SocketAddr> {
+    sub.lock().unwrap().filter(|(_, until)| Instant::now() < *until).map(|(a, _)| a)
+}
+
+/// 燈條要不要追光。主程式靠這個決定要不要縮圖讀回
+pub fn glow_wanted() -> bool {
+    LED.get().is_some_and(|l| alive(&l.glow).is_some())
+}
+
+/// 送一包四邊的顏色（`ledglow::packet` 做好的）
+pub fn send_glow(p: &[u8]) {
+    let Some(led) = LED.get() else { return };
+    if let Some(addr) = alive(&led.glow) {
+        let _ = led.sock.send_to(p, addr);
+    }
+}
+
+/// 告訴燈條追光停了，它馬上淡回自己的模式
+pub fn glow_stop() {
+    let Some(led) = LED.get() else { return };
+    if let Some(addr) = alive(&led.glow) {
+        let _ = led.sock.send_to(b"VDE0", addr);
+    }
 }
 
 /// 燈條要不要音量：有人訂閱而且本機正在播。音訊擷取靠這個決定要不要開。

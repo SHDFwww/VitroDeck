@@ -103,7 +103,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             use crate::settings::{PAGES, Page};
             let page = match rest.trim_start_matches(':') {
                 "account" => Page::Account,
-                "lyrics" => Page::Lyrics,
+                "lyrics" | "verify" => Page::Lyrics,
                 "vinyl" => Page::Vinyl,
                 "mini" => Page::Mini,
                 "viz" => Page::Viz,
@@ -126,6 +126,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
                 page: PAGES.iter().position(|p| *p == page).unwrap_or(0),
                 fonts,
                 fonts_reveal: fonts.is_some(),
+                verify_ask: rest.trim_start_matches(':') == "verify",
                 hot: std::env::var("VITRO_PREFS_HOVER").ok().and_then(|v| v.parse().ok()).map(crate::prefs::Hit::FontRow),
                 ..Default::default()
             };

@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 256 256">
+  <!-- 圖示原稿。改完跑 cargo run 的 make_icon 範例，重新產生 icon.png／icon.ico／icon_1024.png -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12121a"/>
+      <stop offset="1" stop-color="#08080c"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".10"/>
+      <stop offset=".5" stop-color="#fff" stop-opacity=".02"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="128" cy="116" r="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#26c79a" stop-opacity=".20"/>
+      <stop offset="1" stop-color="#26c79a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="face" x1="86" y1="0" x2="170" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2ed67a"/>
+      <stop offset="1" stop-color="#1e96be"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="74" x2="0" y2="166" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff" stop-opacity=".16"/>
+      <stop offset=".45" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <!-- 側卡：越往外越暗，像離光源遠 -->
+    <linearGradient id="l1" x1="86" y1="0" x2="62" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#70748a"/>
+      <stop offset="1" stop-color="#585c70"/>
+    </linearGradient>
+    <linearGradient id="l2" x1="60" y1="0" x2="40" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#454859"/>
+      <stop offset="1" stop-color="#333544"/>
+    </linearGradient>
+    <linearGradient id="r1" x1="170" y1="0" x2="194" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#70748a"/>
+      <stop offset="1" stop-color="#585c70"/>
+    </linearGradient>
+    <linearGradient id="r2" x1="196" y1="0" x2="216" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#454859"/>
+      <stop offset="1" stop-color="#333544"/>
+    </linearGradient>
+    <!-- 倒影的淡出。套在鏡射前的座標裡（卡片底邊 y=166 往上），所以會沿著每張卡自己的底邊淡出 -->
+    <linearGradient id="fade" x1="0" y1="166" x2="0" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff" stop-opacity=".30"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <mask id="fadeMask" maskUnits="userSpaceOnUse" x="0" y="0" width="256" height="256">
+      <rect x="0" y="0" width="256" height="256" fill="url(#fade)"/>
+    </mask>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3"/>
+    </filter>
+    <clipPath id="tile">
+      <rect width="256" height="256" rx="56"/>
+    </clipPath>
+
+    <!-- 卡片本體。側卡用同色描邊＋圓角接合做出小圓角，幾何往內縮半個描邊寬 -->
+    <path id="cardL2" d="M58.5 75.5 L41.5 101.5 L41.5 138.5 L58.5 164.5 Z" fill="url(#l2)" stroke="url(#l2)" stroke-width="3" stroke-linejoin="round"/>
+    <path id="cardL1" d="M84.5 75.5 L63.5 89.5 L63.5 150.5 L84.5 164.5 Z" fill="url(#l1)" stroke="url(#l1)" stroke-width="3" stroke-linejoin="round"/>
+    <path id="cardR2" d="M197.5 75.5 L214.5 101.5 L214.5 138.5 L197.5 164.5 Z" fill="url(#r2)" stroke="url(#r2)" stroke-width="3" stroke-linejoin="round"/>
+    <path id="cardR1" d="M171.5 75.5 L192.5 89.5 L192.5 150.5 L171.5 164.5 Z" fill="url(#r1)" stroke="url(#r1)" stroke-width="3" stroke-linejoin="round"/>
+    <g id="cardC">
+      <rect x="86" y="74" width="84" height="92" rx="4" fill="url(#face)"/>
+      <rect x="86" y="74" width="84" height="92" rx="4" fill="url(#gloss)"/>
+    </g>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect width="256" height="256" fill="url(#bg)"/>
+    <rect width="256" height="256" fill="url(#glow)"/>
+
+    <!-- 倒影：每張卡沿自己的底邊鏡射（側卡底邊是斜的，所以是斜切變換） -->
+    <g id="reflection">
+      <g transform="matrix(1 2.6 0 -1 0 178)"><use xlink:href="#cardL2" mask="url(#fadeMask)"/></g>
+      <g transform="matrix(1 -2.6 0 -1 0 843.6)"><use xlink:href="#cardR2" mask="url(#fadeMask)"/></g>
+      <g transform="matrix(1 1.166667 0 -1 0 233.666667)"><use xlink:href="#cardL1" mask="url(#fadeMask)"/></g>
+      <g transform="matrix(1 -1.166667 0 -1 0 532.333333)"><use xlink:href="#cardR1" mask="url(#fadeMask)"/></g>
+      <g transform="matrix(1 0 0 -1 0 334)"><use xlink:href="#cardC" mask="url(#fadeMask)"/></g>
+    </g>
+
+    <g id="cards">
+    <use xlink:href="#cardL2"/>
+    <use xlink:href="#cardR2"/>
+    <use xlink:href="#cardL1"/>
+    <use xlink:href="#cardR1"/>
+    <!-- 中央那張壓在側卡上的影子，把兩者分開 -->
+    <rect x="86" y="76" width="84" height="92" rx="4" fill="#000" opacity=".55" filter="url(#shadow)"/>
+    <use xlink:href="#cardC"/>
+    </g>
+
+    <rect x=".5" y=".5" width="255" height="255" rx="55.5" fill="none" stroke="url(#rim)"/>
+  </g>
+</svg>

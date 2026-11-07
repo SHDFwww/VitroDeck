@@ -91,6 +91,8 @@ pub struct TrackMeta {
     pub uri: String,
     /// `None` = 還不知道
     pub liked: Option<bool>,
+    /// 專輯封面的公開網址（Discord 狀態用）。`None` = 還沒問完，`Some("")` = 問了但沒有
+    pub art: Option<String>,
 }
 
 /// Spotify 的音量。`vol` 是 `None` 代表還沒問到。
@@ -131,6 +133,8 @@ pub enum Cmd {
     Tray(bool),
     /// 迷你視窗的歌詞模式開著：縮在系統列時也要抓歌詞（曲目資訊照樣不抓）
     WantLyrics(bool),
+    /// Discord 狀態開著：縮在系統列時，沒比對到收藏的那首也要問曲目資訊（為了封面網址）
+    WantArt(bool),
     RefreshAlbums,
     /// 播一整張專輯（uri, 專輯名）。SMTC 做不到這件事（它只有上一首／下一首），
     /// 所以這條一定走 Web API。名字只拿來寫通知列。
@@ -239,6 +243,7 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let mut visible = true;
     let mut in_tray = false;
     let mut want_lyrics = false;
+    let mut want_art = false;
     let mut web_next = Instant::now();
     let mut last_id = String::new();
     // 縮在系統列時換歌，這首的曲目資訊（愛心、音量）／歌詞被跳過了沒。叫回來時只補跳過的那首：
@@ -270,6 +275,12 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         last_id.clear();
                     }
                     want_lyrics = v;
+                }
+                Cmd::WantArt(v) => {
+                    if v && !want_art && in_tray && meta_skipped {
+                        last_id.clear();
+                    }
+                    want_art = v;
                 }
                 Cmd::Tray(v) => {
                     in_tray = v;
@@ -468,11 +479,13 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
             // 歌詞交給另一條執行緒：一抓好幾秒，擋在這裡的話這段時間
             // 播放狀態不會更新、按暫停也要排隊
             lyrics_skipped = in_tray && !want_lyrics;
-            meta_skipped = in_tray;
+            // 收藏裡比對到的已經有封面網址，Discord 不用再問
+            let meta_off = in_tray && !(want_art && t.art == Art::SmtcThumb);
+            meta_skipped = meta_off;
             if !lyrics_skipped {
                 let _ = lyrics_tx.send(t.clone());
             }
-            if !in_tray {
+            if !meta_off {
                 if t.track_uri.is_empty() {
                     // SMTC 來源：要多問兩個請求，等停下來再問
                     pending_meta = Some((t.id.clone(), Instant::now() + META_SETTLE));
@@ -485,7 +498,7 @@ fn run(mut cfg: Config, paths: Paths, shared: Arc<Shared>, rx: Receiver<Cmd>) {
         if let Some((id, due)) = pending_meta.take() {
             match np.as_ref() {
                 // 已經換下一首了（下一輪會重新排）或停播了：不用問
-                Some(t) if t.id == id && !in_tray => {
+                Some(t) if t.id == id && (!in_tray || want_art) => {
                     if Instant::now() >= due {
                         // 曲目 URI（愛心要用）與音量，兩個請求，幾百毫秒
                         track_meta(&mut sp, t, &shared);
@@ -717,9 +730,11 @@ fn track_meta(sp: &mut Spotify, t: &NowPlaying, shared: &Arc<Shared>) {
     // 先清掉上一首的，免得查詢那幾百毫秒裡愛心還掛著上一首的狀態
     *shared.meta.lock().unwrap() = TrackMeta { id: t.id.clone(), ..Default::default() };
     if !sp.logged_in() {
+        shared.meta.lock().unwrap().art = Some(String::new());
         return;
     }
     let mut uri = t.track_uri.clone();
+    let mut art = String::new();
     let mut vol = Volume { vol: t.volume, supported: t.supports_volume };
     if uri.is_empty()
         && let Ok(Some(st)) = sp.get("/me/player", &[]) {
@@ -729,6 +744,8 @@ fn track_meta(sp: &mut Spotify, t: &NowPlaying, shared: &Arc<Shared>) {
                     == crate::albums::norm_name(&t.title)
             {
                 uri = it["uri"].as_str().unwrap_or("").to_string();
+                // 大到小排，第一張通常是 640px
+                art = it["album"]["images"][0]["url"].as_str().unwrap_or("").to_string();
                 vol = Volume {
                     vol: st["device"]["volume_percent"].as_u64().map(|v| v.min(100) as u8),
                     supported: st["device"]["supports_volume"].as_bool().unwrap_or(true),
@@ -736,7 +753,7 @@ fn track_meta(sp: &mut Spotify, t: &NowPlaying, shared: &Arc<Shared>) {
             }
         }
     let liked = if uri.starts_with("spotify:track:") { sp.liked(&uri).ok() } else { None };
-    *shared.meta.lock().unwrap() = TrackMeta { id: t.id.clone(), uri, liked };
+    *shared.meta.lock().unwrap() = TrackMeta { id: t.id.clone(), uri, liked, art: Some(art) };
     if vol.vol.is_some() || !vol.supported {
         *shared.volume.lock().unwrap() = vol;
         shared.volume_rev.fetch_add(1, Ordering::Relaxed);

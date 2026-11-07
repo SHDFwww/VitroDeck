@@ -17,6 +17,7 @@ mod audio;
 mod config;
 mod clipboard;
 mod cover;
+mod discord;
 mod eel;
 mod extract;
 mod gfx;
@@ -25,6 +26,7 @@ mod instance;
 mod layered;
 mod lead;
 mod ledfeed;
+mod ledglow;
 mod glass;
 mod lyrics;
 mod milk;
@@ -488,6 +490,8 @@ struct Render {
     layer: Option<gfx::Offscreen>,
     /// 文字 PV（實驗中）。第一次打開才建，沒開過就零開銷
     pv: Option<pv::Pv>,
+    /// 燈條追光。第一次要送才建
+    glow: Option<ledglow::Glow>,
     /// 迷你視窗在 Win11 走交換鏈，要同一個 instance 與介面卡開 surface
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -563,6 +567,10 @@ struct App {
     mini: Option<mini::Mini>,
     /// 上次告訴 poller 的「迷你視窗要歌詞」
     mini_ly_sent: bool,
+    /// Discord 狀態（`discord_presence`）。設定關著是 `None`，不開執行緒
+    presence: Option<discord::Presence>,
+    /// 上次告訴 poller 的「Discord 要封面網址」
+    art_sent: bool,
     /// 下一次 `sync_mini` 要把迷你視窗叫回主螢幕右下角
     mini_recall: bool,
     /// 設定視窗。`prefs_want`：有人要開（齒輪、逗號鍵），在 about_to_wait 開或拉到前面
@@ -1765,6 +1773,46 @@ impl App {
         }
     }
 
+    /// Discord 個人狀態。設定關掉時丟掉 `Presence`，它的執行緒會清空狀態再結束
+    fn sync_presence(&mut self) {
+        let on = self.cfg.discord_presence;
+        if on != self.art_sent {
+            self.art_sent = on;
+            let _ = self.player.tx.send(player::Cmd::WantArt(on));
+        }
+        if !on {
+            self.presence = None;
+            return;
+        }
+        let p = self.presence.get_or_insert_with(discord::Presence::start);
+        let now = self.player.shared.now.lock().ok();
+        let Some(n) = now.as_ref().and_then(|g| g.as_ref()) else {
+            p.update(None);
+            return;
+        };
+        let meta = self.player.shared.meta.lock().ok();
+        let (art, art_pending) = match &n.art {
+            player::Art::Url(u) => (Some(u.as_str()), false),
+            player::Art::SmtcThumb => match meta.as_ref().filter(|m| m.id == n.id).and_then(|m| m.art.as_deref()) {
+                Some("") => (None, false),
+                Some(u) => (Some(u), false),
+                None => (None, true),
+            },
+        };
+        p.update(Some(discord::Track {
+            id: &n.id,
+            title: &n.title,
+            artist: &n.artist,
+            album: &n.album,
+            art,
+            art_pending,
+            playing: n.playing,
+            pos_ms: n.progress_ms + if n.playing { n.at.elapsed().as_millis() as i64 } else { 0 },
+            len_ms: n.duration_ms,
+            zh: zh::enabled(),
+        }));
+    }
+
     /// 主視窗停畫：不排下一幀、關掉只給畫面用的擷取，迴圈改成定時醒來看一下（`about_to_wait`）
     fn park(&mut self, el: &ActiveEventLoop) {
         self.parked = Some(Parked { at: Instant::now(), hidden: self.hidden(), sig: self.stir_sig() });
@@ -1945,6 +1993,13 @@ impl App {
         let Some(p) = self.prefs.as_mut() else { return };
         match p.event(ev, &self.cfg, screens) {
             Some(prefs::Action::Close) => self.prefs = None,
+            // 要下載 500 MB：第一次打開先問。下載過的不問，模型刪掉才會再問
+            Some(prefs::Action::Edit(settings::Item::LyricsVerify, _))
+                if !self.cfg.lyrics_verify && !crate::align::engine_ready(&self.paths) =>
+            {
+                p.ask_verify();
+            }
+            Some(prefs::Action::VerifyYes) => self.set_item(settings::Item::LyricsVerify, settings::Edit::Press),
             // 裝置選單、關於、設定精靈是主視窗上的面板：先把主視窗叫到前面，不然開在看不到的地方
             Some(prefs::Action::Edit(it, e))
                 if matches!(it, settings::Item::Device | settings::Item::About)
@@ -2950,6 +3005,7 @@ impl App {
             // 曲名、清單這些下一幀就換；已經抓回來的歌詞要等下一首才照新設定
             settings::Item::LyricsTraditional => zh::set_enabled(self.cfg.lyrics_traditional),
             settings::Item::LyricsAutoalign => self.sync_autoalign(),
+            settings::Item::LyricsVerify => crate::align::set_verify(self.cfg.lyrics_verify),
             // 拖曳中先不套：設定視窗會跟著縮放，滑桿就在游標底下跑掉。放開時（`DragEnd`）才套
             settings::Item::UiScale
                 if self.prefs.as_ref().and_then(|p| p.dragging()) != Some(settings::Item::UiScale) =>
@@ -3924,9 +3980,21 @@ impl App {
             let mut pass = gfx::pass(&mut enc, &view, "blit", Some(wgpu::Color::BLACK));
             r.blit.draw(&r.gpu, &mut pass, &r.target.view);
         }
+        // 燈條追光：文字 PV 演著、主視窗在前景，燈條那頭又有訂閱才做
+        let glow = self.focused && self.view == View::Now && self.pv_mix.value() > 0.0 && ledfeed::glow_wanted();
+        if glow {
+            r.glow.get_or_insert_with(|| ledglow::Glow::new(&r.gpu)).record(&r.gpu, &mut enc, &r.target);
+        }
         r.gpu.queue.submit([enc.finish()]);
         r.gpu.queue.present(frame);
         self.presented = true;
+        if let Some(g) = r.glow.as_mut() {
+            if glow {
+                g.after_submit(&r.gpu);
+            } else {
+                g.stop();
+            }
+        }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -4058,6 +4126,7 @@ impl ApplicationHandler<UserEv> for App {
             gpu,
             layer: None,
             pv: None,
+            glow: None,
             instance,
             adapter,
         };
@@ -4078,6 +4147,7 @@ impl ApplicationHandler<UserEv> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.sync_taskbar();
+        self.sync_presence();
         self.sync_mini(el);
         self.tick_mini();
         self.sync_prefs(el);
@@ -4632,6 +4702,8 @@ fn main() -> anyhow::Result<()> {
         taskbar: Default::default(),
         mini: None,
         mini_ly_sent: false,
+        presence: None,
+        art_sent: false,
         mini_recall: false,
         prefs: None,
         prefs_want: false,

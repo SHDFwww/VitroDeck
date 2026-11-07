@@ -102,6 +102,9 @@ pub struct Config {
     /// 播放時用 loopback 量歌詞跟歌聲差多少、自動校正，順便抓配錯歌的歌詞（見 align/）。
     /// 第一次用時下載 36 MB 的人聲模型。預設關，關著時跟沒有這個功能一樣。Rust 版才有
     pub lyrics_autoalign: bool,
+    /// 開著自動對齊時，再用語音辨識比對歌詞的字來判斷配錯（見 align/verify.rs）。
+    /// 第一次用時下載 whisper.cpp 與約 500 MB 的模型。預設關。Rust 版才有
+    pub lyrics_verify: bool,
     /// 指定 LyricsPlus 要用哪些來源。預設排除 apple —— 那條需要 Apple Music
     /// 訂閱，而實測 qq 的逐字覆蓋率反而更好（華語／西洋／日文都中）。
     pub lyricsplus_sources: String,
@@ -175,6 +178,8 @@ pub struct Config {
     pub taskbar_progress: bool,
     /// 主視窗的標題（工作列按鈕、Alt+Tab 上的字）換成正在播的「歌手 - 歌名」。Rust 版才有
     pub taskbar_title: bool,
+    /// Discord 個人狀態顯示「正在聽」（歌名、歌手、封面、進度）。Rust 版才有
+    pub discord_presence: bool,
 
     /// 不認得的欄位原樣留著寫回去。少了這個，存一次設定就會把
     /// Python 版（或之後的版本）的欄位全部刪掉。
@@ -199,6 +204,7 @@ impl Default for Config {
             lyrics_kugou: true,
             lyrics_netease: true,
             lyrics_autoalign: false,
+            lyrics_verify: false,
             lyricsplus_sources: "qq,musixmatch,spotify".into(),
             viz_fps: 60,
             viz_category: "all".into(),
@@ -228,6 +234,7 @@ impl Default for Config {
             fps_limit: 0,
             taskbar_progress: false,
             taskbar_title: false,
+            discord_presence: false,
             extra: Default::default(),
         }
     }

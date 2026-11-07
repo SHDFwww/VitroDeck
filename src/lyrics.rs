@@ -122,7 +122,7 @@ fn safe_name(s: &str) -> String {
 }
 
 impl Lyrics {
-    fn has_content(&self) -> bool {
+    pub fn has_content(&self) -> bool {
         !self.synced.is_empty() || !self.plain.is_empty() || self.source == "instrumental"
     }
 
@@ -811,7 +811,8 @@ mod tests {
             synced: vec![Line { t: 1000, text: "別首歌".into(), ..Default::default() }],
             source: "synced".into(),
             provider: "KuGou".into(),
-            chain: 2,
+            // 要是現在的版本：舊的行級快取會被當成該升級，跑去網路重抓
+            chain: super::CHAIN_VERSION,
             ..Default::default()
         };
         crate::config::write_json(&dir.join("k1.json"), &wrong).unwrap();

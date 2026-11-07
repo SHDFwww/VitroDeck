@@ -189,7 +189,13 @@ pub fn plausible(c: &Candidate, artist: &str, title: &str, duration_ms: i64) -> 
     if pick(std::slice::from_ref(c), artist, title, if known { duration_ms } else { 0 }).is_some() {
         return true;
     }
-    known && (c.duration_ms - duration_ms).abs() <= STRICT_DELTA_MS && artist_matches(artist, &c.artist)
+    // 兩邊曲名都有漢字、卻對不上，就是同歌手的另一首（理想混蛋〈時間走了但你沒走〉被配到〈我反芻著你留下的寂寞〉，
+    // 兩首剛好都 4:15）。曲名寫法不同只可能是換了文字系統（英文／羅馬拼音 vs 日文）
+    known && (c.duration_ms - duration_ms).abs() <= STRICT_DELTA_MS && artist_matches(artist, &c.artist) && !(has_han(&c.title) && has_han(title))
+}
+
+fn has_han(s: &str) -> bool {
+    s.chars().any(|c| matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}'))
 }
 
 #[cfg(test)]
@@ -240,6 +246,16 @@ mod tests {
         assert!(!plausible(&got, "美秀集團", "小老婆", 315_000));
         assert!(!plausible(&got, "美秀集團", "小老婆", 0));
         assert!(plausible(&got, "美秀集團", "捲菸", 232_400));
+    }
+
+    #[test]
+    fn 同歌手同長度但曲名都是中文且對不上不收() {
+        // LyricsPlus 帶專輯與長度搜〈時間走了但你沒走〉，QQ 回了同歌手、同樣 4:15 的〈我反刍着你留下的寂寞〉
+        let got = c(1, "我反刍着你留下的寂寞", "理想混蛋", 255_000);
+        assert!(!plausible(&got, "理想混蛋", "時間走了但你沒走", 255_000));
+        // 同一首（簡繁不同）還是收
+        let same = c(2, "时间走了但你没走", "理想混蛋", 255_000);
+        assert!(plausible(&same, "理想混蛋", "時間走了但你沒走", 255_000));
     }
 
     #[test]

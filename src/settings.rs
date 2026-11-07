@@ -71,12 +71,16 @@ pub enum Item {
     LyricsPvGeo,
     /// 播放時聽歌聲自動校正歌詞時間、抓配錯歌的歌詞（`align/`）。只在設定視窗
     LyricsAutoalign,
+    /// 聽寫歌聲、比對歌詞的字來判斷配錯（`align/verify.rs`）。只在設定視窗，而且自動對齊開著才出現
+    LyricsVerify,
     /// 主視窗的畫面更新率上限。只在設定視窗
     FpsLimit,
     /// 工作列按鈕上的播放進度。只在設定視窗
     TaskbarProgress,
     /// 工作列按鈕上的字換成「歌手 - 歌名」。只在設定視窗
     TaskbarTitle,
+    /// Discord 個人狀態顯示正在聽。只在設定視窗
+    DiscordPresence,
 }
 
 /// 字型大小與介面大小的滑桿：一格 5%，80%～150%
@@ -182,9 +186,11 @@ impl Item {
             Item::LyricsPvV2 => "文字PV_v2",
             Item::LyricsPvGeo => "背景幾何圖形",
             Item::LyricsAutoalign => "自動對齊歌詞",
+            Item::LyricsVerify => "比對歌詞內容",
             Item::FpsLimit => "畫面更新率上限",
             Item::TaskbarProgress => "工作列顯示播放進度",
             Item::TaskbarTitle => "工作列顯示歌手與歌名",
+            Item::DiscordPresence => "Discord 顯示正在聽",
         }
     }
 
@@ -198,6 +204,7 @@ impl Item {
             Item::UpdateCheck => "只問 GitHub 有沒有新版，不會自己裝",
             Item::SpotifyStatus => "還沒有 client_id 的話，按一下開設定精靈",
             Item::LyricsAutoalign => "首次使用需下載約 36MB 模型",
+            Item::LyricsVerify => "首次使用需下載約 500MB 模型",
             _ => "",
         }
     }
@@ -206,7 +213,7 @@ impl Item {
     pub fn badge(self) -> &'static str {
         match self {
             Item::Appearance => "淺色實驗中",
-            Item::LyricsPv | Item::LyricsPvV2 | Item::LyricsPvGeo => "實驗中",
+            Item::LyricsPv | Item::LyricsPvV2 | Item::LyricsPvGeo | Item::LyricsVerify => "實驗中",
             _ => "",
         }
     }
@@ -238,6 +245,7 @@ impl Item {
             Item::LyricsPvV2 => on_off(cfg.lyrics_pv_v2),
             Item::LyricsPvGeo => on_off(cfg.lyrics_pv_geo),
             Item::LyricsAutoalign => on_off(cfg.lyrics_autoalign),
+            Item::LyricsVerify => on_off(cfg.lyrics_verify),
             Item::Vinyl => on_off(cfg.vinyl),
             Item::VinylRpm => rpm_label(cfg.vinyl_rpm),
             Item::MiniEnabled => on_off(cfg.mini_enabled),
@@ -284,6 +292,7 @@ impl Item {
             Item::FpsLimit => format!("{} fps", cfg.fps_limit),
             Item::TaskbarProgress => on_off(cfg.taskbar_progress),
             Item::TaskbarTitle => on_off(cfg.taskbar_title),
+            Item::DiscordPresence => on_off(cfg.discord_presence),
         }
     }
 
@@ -328,6 +337,7 @@ impl Item {
             Item::LyricsPvV2 => cfg.lyrics_pv_v2 = !cfg.lyrics_pv_v2,
             Item::LyricsPvGeo => cfg.lyrics_pv_geo = !cfg.lyrics_pv_geo,
             Item::LyricsAutoalign => cfg.lyrics_autoalign = !cfg.lyrics_autoalign,
+            Item::LyricsVerify => cfg.lyrics_verify = !cfg.lyrics_verify,
             Item::Vinyl => cfg.vinyl = !cfg.vinyl,
             Item::VinylRpm => {
                 // 不在刻度上的（Python 版滑桿拉出來的 7 rpm 之類）從最近的那格開始
@@ -345,6 +355,7 @@ impl Item {
             Item::CloseToTray => cfg.close_to_tray = !cfg.close_to_tray,
             Item::TaskbarProgress => cfg.taskbar_progress = !cfg.taskbar_progress,
             Item::TaskbarTitle => cfg.taskbar_title = !cfg.taskbar_title,
+            Item::DiscordPresence => cfg.discord_presence = !cfg.discord_presence,
             Item::VizEnabled => cfg.viz_enabled = !cfg.viz_enabled,
             Item::VizFps => {
                 const STEPS: [u32; 4] = [30, 60, 120, 0];
@@ -420,6 +431,7 @@ impl Item {
             Item::LyricsPvV2 => cfg.lyrics_pv_v2,
             Item::LyricsPvGeo => cfg.lyrics_pv_geo,
             Item::LyricsAutoalign => cfg.lyrics_autoalign,
+            Item::LyricsVerify => cfg.lyrics_verify,
             Item::Vinyl => cfg.vinyl,
             Item::MiniEnabled => cfg.mini_enabled,
             Item::MiniLocked => cfg.mini_locked,
@@ -427,6 +439,7 @@ impl Item {
             Item::CloseToTray => cfg.close_to_tray,
             Item::TaskbarProgress => cfg.taskbar_progress,
             Item::TaskbarTitle => cfg.taskbar_title,
+            Item::DiscordPresence => cfg.discord_presence,
             Item::VizEnabled => cfg.viz_enabled,
             Item::VizShaders => cfg.viz_preset_shaders,
             Item::UpdateCheck => cfg.update_check,
@@ -536,6 +549,7 @@ impl Item {
         match self {
             Item::LyricsPvV2 => !cfg.lyrics_pv,
             Item::LyricsPvGeo => !(cfg.lyrics_pv && cfg.lyrics_pv_v2),
+            Item::LyricsVerify => !cfg.lyrics_autoalign,
             _ => false,
         }
     }
@@ -624,7 +638,7 @@ impl Page {
     pub fn groups(self) -> &'static [(&'static str, &'static [Item])] {
         use Item as I;
         match self {
-            Page::Account => &[("帳號", &[I::SpotifyStatus]), ("播放", &[I::Device, I::Refresh])],
+            Page::Account => &[("帳號", &[I::SpotifyStatus]), ("播放", &[I::Device, I::Refresh]), ("Discord", &[I::DiscordPresence])],
             Page::Display => &[
                 ("封面流", &[I::Sort, I::CoverScale]),
                 ("視窗", &[I::StartFullscreen, I::Screen, I::F11One, I::F11Span, I::CloseToTray, I::TaskbarProgress, I::TaskbarTitle]),
@@ -632,7 +646,7 @@ impl Page {
                 ("顏色", &[I::Appearance, I::AccentFollow]),
                 ("進階", &[I::FpsLimit]),
             ],
-            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsAutoalign, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv, I::LyricsPvV2, I::LyricsPvGeo])],
+            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsAutoalign, I::LyricsVerify, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv, I::LyricsPvV2, I::LyricsPvGeo])],
             Page::Vinyl => &[("", &[I::Vinyl, I::VinylRpm])],
             Page::Mini => &[("", &[I::MiniEnabled, I::MiniLocked, I::MiniLyrics, I::MiniRecall])],
             Page::Viz => &[("", &[I::VizEnabled]), ("MilkDrop", &[I::VizFps, I::VizCategory, I::VizShaders])],
@@ -675,7 +689,7 @@ mod tests {
         for it in ITEMS {
             assert_eq!(all.iter().filter(|x| *x == it).count(), 1, "{it:?}");
         }
-        assert_eq!(all.len(), ITEMS.len() + 14, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV 三列、自動對齊、更新率上限與工作列的進度、曲名");
+        assert_eq!(all.len(), ITEMS.len() + 16, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV 三列、自動對齊、比對歌詞、更新率上限、工作列的進度、曲名與 Discord");
     }
 
     #[test]

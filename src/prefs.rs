@@ -135,6 +135,9 @@ pub enum Hit {
     Back,
     /// 字型清單的第幾個字型（`Layout::fonts` 的索引）
     FontRow(usize),
+    /// 「比對歌詞內容」確認框的兩顆鈕
+    VerifyYes,
+    VerifyNo,
 }
 
 /// 字型清單在挑哪一個字型
@@ -162,6 +165,8 @@ pub enum Action {
     Font(FontSlot, String),
     /// 滑桿放開了。介面大小拖曳中不套用（視窗會跟著縮放、滑桿在游標底下跑掉），放開才套
     DragEnd(Item),
+    /// 確認框按了下載並開啟
+    VerifyYes,
     Close,
 }
 
@@ -183,6 +188,8 @@ pub struct Ui {
     pub fonts_scroll: f32,
     /// 下一幀把選中的字型捲到中間（剛打開清單時）
     pub fonts_reveal: bool,
+    /// 「比對歌詞內容」的確認框開著：要下載 500 MB，第一次打開前先講清楚
+    pub verify_ask: bool,
 }
 
 impl Ui {
@@ -283,7 +290,77 @@ pub fn paint(p: &mut Paint, w: f32, h: f32, ui: &Ui, an: &mut Anims, ctx: &Ctx) 
         let x = w - win::SIDE_INSET * 0.5 - win::SCROLL_W;
         p.quads.push(Quad::new(x, ty0, win::SCROLL_W, th).radius(win::SCROLL_W * 0.5).color(theme::ink(win::SCROLL_A)));
     }
+    if ui.verify_ask {
+        verify_dialog(p, w, h, ui, &mut lay);
+    }
     lay
+}
+
+/// 確認框的三段。不斷行，最窄的視窗（640）放得下
+const VERIFY_TEXT: [(&str, [&str; 3]); 3] = [
+    ("好處", [
+        "聽寫歌聲的字跟歌詞比，抓到配錯就自動換下一個來源",
+        "約在第一句後 70 秒換好，不用等整首播完",
+        "35 首測試：對的歌沒有誤判，1122 組配錯沒有漏掉",
+    ]),
+    ("代價", [
+        "下載約 500 MB，放在資料夾的 models\\whisper",
+        "每份新歌詞聽寫一次：約 8 秒、4 條執行緒、800 MB 記憶體",
+        "需要 Visual C++ 執行階段，多數電腦已經有了",
+    ]),
+    ("限制", [
+        "只比開頭 60 秒，聽不出字的歌不會判定",
+        "測試以華語為主，日韓文還沒驗證",
+        "聲音只在這台電腦處理，不會上傳",
+    ]),
+];
+
+/// 第一次打開「比對歌詞內容」前的確認框。字一律畫在色塊上面，蓋不住底下的字，
+/// 所以開著時把底下的字清掉，只留變暗的色塊當背景
+fn verify_dialog(p: &mut Paint, w: f32, h: f32, ui: &Ui, lay: &mut Layout) {
+    const PAD: f32 = 22.0;
+    const GAP: f32 = 10.0;
+    p.text.begin();
+    p.text.cap_scale(1.0);
+    lay.hits.clear();
+    lay.rows.clear();
+    p.quads.push(Quad::new(0.0, 0.0, w, h).color(theme::scrim(0.55)));
+
+    let body = ty::CAPTION;
+    let lines: f32 = VERIFY_TEXT.iter().map(|(_, rows)| body.line * (rows.len() + 1) as f32).sum();
+    let cw = (w - 48.0).min(520.0);
+    let ch = PAD * 2.0 + ty::TITLE.line + GAP * (VERIFY_TEXT.len() + 1) as f32 + lines + ctl::BTN_H;
+    let card = Rect::new((w - cw) * 0.5, ((h - ch) * 0.5).max(4.0), cw, ch);
+    p.quads.push(
+        Quad::new(card.x, card.y, card.w, card.h)
+            .radius(theme::radius::SIDEBAR)
+            .color(theme::window_bg())
+            .border(1.0, theme::ink(win::SIDE_EDGE_A)),
+    );
+    let x = card.x + PAD;
+    let mut y = card.y + PAD;
+    p.text.push("打開「比對歌詞內容」？", x, y, ty::TITLE.size, ty::TITLE.line, theme::fg(), 600, None, None);
+    y += ty::TITLE.line + GAP;
+    for (head, rows) in VERIFY_TEXT {
+        p.text.push(head, x, y, body.size, body.line, theme::ink(0.55), 600, None, None);
+        y += body.line;
+        for row in rows {
+            p.text.push(&format!("·  {row}"), x, y, body.size, body.line, theme::ink(0.92), 400, None, None);
+            y += body.line;
+        }
+        y += GAP;
+    }
+
+    let (yes, no) = ("下載並開啟", "取消");
+    let (yw, nw) = (wd::button_width(p.text, yes), wd::button_width(p.text, no));
+    let right = card.x + card.w - PAD;
+    let y_rect = Rect::new(right - yw, y, yw, ctl::BTN_H);
+    let n_rect = Rect::new(y_rect.x - 10.0 - nw, y, nw, ctl::BTN_H);
+    let st = |h: Hit| State { hot: ui.hot == Some(h), down: ui.down == Some(h) && ui.hot == Some(h), ..Default::default() };
+    wd::button(p, &n_rect, no, Kind::Normal, st(Hit::VerifyNo));
+    wd::button(p, &y_rect, yes, Kind::Primary, st(Hit::VerifyYes));
+    lay.hits.push((Hit::VerifyNo, n_rect));
+    lay.hits.push((Hit::VerifyYes, y_rect));
 }
 
 /// 一頁的設定列。`top` 是捲動後內容的頂（0 或負的）
@@ -791,6 +868,21 @@ impl Prefs {
         gfx::zoomed_fit(self.window.scale_factor(), (sz.width, sz.height), (win::MIN_W, win::MIN_H))
     }
 
+    /// 打開「比對歌詞內容」之前先問（主程式判斷要不要問）
+    pub fn ask_verify(&mut self) {
+        self.ui.verify_ask = true;
+        self.ui.hot = None;
+        self.ui.down = None;
+        self.dirty = true;
+    }
+
+    fn close_verify(&mut self) {
+        self.ui.verify_ask = false;
+        self.ui.hot = None;
+        self.dirty = true;
+        self.window.set_cursor(CursorIcon::Default);
+    }
+
     /// 正在拖的滑桿
     pub fn dragging(&self) -> Option<Item> {
         self.drag
@@ -857,7 +949,7 @@ impl Prefs {
                 self.ui.hot = hot;
                 let live = match hot {
                     Some(Hit::Ctrl(it)) => !it.disabled(cfg),
-                    Some(Hit::Page(_) | Hit::Back | Hit::FontRow(_)) => true,
+                    Some(Hit::Page(_) | Hit::Back | Hit::FontRow(_) | Hit::VerifyYes | Hit::VerifyNo) => true,
                     None => false,
                 };
                 self.window.set_cursor(if live { CursorIcon::Pointer } else { CursorIcon::Default });
@@ -873,7 +965,7 @@ impl Prefs {
                 match self.layout.hit(x, y) {
                     Some(Hit::Page(i)) => self.set_page(i),
                     // 返回鈕與字型清單的列放開時才算
-                    Some(h @ (Hit::Back | Hit::FontRow(_))) => self.ui.down = Some(h),
+                    Some(h @ (Hit::Back | Hit::FontRow(_) | Hit::VerifyYes | Hit::VerifyNo)) => self.ui.down = Some(h),
                     Some(Hit::Ctrl(it)) if !it.disabled(cfg) => {
                         self.ui.focus = Some(it);
                         match it.control() {
@@ -913,6 +1005,11 @@ impl Prefs {
                     Some(Hit::Ctrl(Item::FontLatin)) => self.open_fonts(FontSlot::Latin),
                     Some(Hit::Ctrl(it)) => return Some(Action::Edit(it, Edit::Press)),
                     Some(Hit::Back) => self.close_fonts(),
+                    Some(Hit::VerifyNo) => self.close_verify(),
+                    Some(Hit::VerifyYes) => {
+                        self.close_verify();
+                        return Some(Action::VerifyYes);
+                    }
                     Some(Hit::FontRow(i)) => {
                         let slot = self.ui.fonts?;
                         return self.layout.fonts.get(i).cloned().map(|k| Action::Font(slot, k));
@@ -920,6 +1017,7 @@ impl Prefs {
                     _ => {}
                 }
             }
+            WindowEvent::MouseWheel { .. } if self.ui.verify_ask => {}
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => -y * 48.0,
@@ -942,6 +1040,18 @@ impl Prefs {
         let ctrl = self.mods.control_key();
         let shift = self.mods.shift_key();
         let n = PAGES.len();
+        // 確認框開著時底下的東西都動不了
+        if self.ui.verify_ask {
+            match key {
+                Key::Named(NamedKey::Escape) => self.close_verify(),
+                Key::Named(NamedKey::Enter) => {
+                    self.close_verify();
+                    return Some(Action::VerifyYes);
+                }
+                _ => {}
+            }
+            return None;
+        }
         let page_step = |s: &mut Self, d: isize| {
             let i = (s.ui.page as isize + d).rem_euclid(n as isize) as usize;
             s.set_page(i);

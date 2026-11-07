@@ -13,7 +13,9 @@
 //! 手動的單曲微調（`offsets.json`）優先。逐句歌詞故意早約 0.3 秒讓句子先出現（使用者決定先保留），
 //! 所以逐句只修大錯、而且修完仍保留這 0.3 秒。
 
+mod spotcap;
 pub mod umx;
+pub mod verify;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{self, Config, Paths};
 use crate::lyrics::Lyrics;
 use crate::player::{NowPlaying, Shared};
+use verify::{Clip, Seg, Verdict};
 
 const RATE: f64 = 48_000.0;
 /// 對齊的格子：10 ms
@@ -74,14 +77,23 @@ const SILENT_POW: f32 = 1e-7;
 static WANT: AtomicBool = AtomicBool::new(false);
 /// 設定裡關掉了（[`set_enabled`]）：不錄、不量，量過的偏移也不套
 static OFF: AtomicBool = AtomicBool::new(false);
+/// 比對歌詞內容（`verify`）。關著時不下載、不聽，配錯照舊看能量相關度
+static VERIFY: AtomicBool = AtomicBool::new(false);
 /// 備好還沒開執行緒的工人（設定關著啟動的）
 static IDLE: Mutex<Option<Worker>> = Mutex::new(None);
 static TX: OnceLock<SyncSender<Msg>> = OnceLock::new();
 
 enum Msg {
     Audio(u64, Vec<f32>),
+    /// 只有 Spotify 的聲音（`spotcap`）
+    Spot(u64, Vec<f32>),
     Poll(Poll),
     Lyrics(String, Box<Lyrics>),
+    /// whisper 聽完了：哪首、聽到什麼、花幾秒、聽的是不是只有 Spotify 的聲音
+    Heard(String, Result<Vec<Seg>, String>, f32, bool),
+    Installed(Result<(), String>),
+    /// 比對的開關切了
+    Recheck,
 }
 
 #[derive(Clone)]
@@ -104,6 +116,28 @@ pub fn wants_audio() -> bool {
 
 pub fn enabled() -> bool {
     !OFF.load(Ordering::Relaxed)
+}
+
+/// 引擎放哪
+fn engine_dir(paths: &Paths) -> PathBuf {
+    paths.data.join("models").join("whisper")
+}
+
+/// 引擎與模型下載好了沒。還沒的話第一次打開前要先問
+pub fn engine_ready(paths: &Paths) -> bool {
+    verify::ready(&engine_dir(paths))
+}
+
+fn verify_on() -> bool {
+    VERIFY.load(Ordering::Relaxed)
+}
+
+/// 設定視窗切換「比對歌詞內容」時呼叫
+pub fn set_verify(on: bool) {
+    VERIFY.store(on, Ordering::Relaxed);
+    if let Some(tx) = TX.get() {
+        let _ = tx.try_send(Msg::Recheck);
+    }
 }
 
 /// 設定視窗切換時呼叫。關著的時候歌詞執行緒沒送歌詞過來，打開時把正在播的那首補送。
@@ -137,6 +171,13 @@ pub fn audio(q: u64, bytes: impl Iterator<Item = u8>, silent: bool) {
     }
     // 滿了（模型正在算、或卡住）就丟：少一段而已，不能讓音訊執行緒等
     let _ = tx.try_send(Msg::Audio(q, v));
+}
+
+/// `spotcap` 收到聲音時呼叫
+fn spot_audio(q: u64, v: Vec<f32>) {
+    if let Some(tx) = TX.get() {
+        let _ = tx.try_send(Msg::Spot(q, v));
+    }
 }
 
 /// 播放器每輪呼叫。`sure` 見 [`Poll::sure`]
@@ -181,6 +222,10 @@ pub struct Entry {
     pub apply: i64,
     /// 判斷為配錯歌的來源（`Lyrics::provider`），重抓時跳過
     pub bad: Vec<String>,
+    /// 比對過文字、不用再比的那份歌詞（[`fingerprint`]）。通過與不確定都記，不然每次播都要多跑一次
+    pub checked: u64,
+    /// `bad` 是文字比對的結果。不是的話，那是能量相關度封的，要重驗（`retest_old_bans`）
+    pub bad_text: bool,
 }
 
 fn read_store(dir: &Path) -> BTreeMap<String, Entry> {
@@ -388,6 +433,24 @@ struct Song {
     deaf: bool,
     /// 位置不可信、這首先不錄，已經寫過紀錄
     unsure_logged: bool,
+    /// 這份歌詞還沒比對過文字
+    text_todo: bool,
+    /// 錄給 whisper 的聲音，交出去之後是空的
+    clip: Clip,
+    /// `clip` 是只有 Spotify 的聲音（不是整台電腦的混音）
+    clip_spot: bool,
+    /// 上一輪之後收到、還沒確認位置的 Spotify 聲音
+    spot_pending: Vec<(u64, Vec<f32>)>,
+    /// whisper 正在聽
+    listening: bool,
+    /// 聽到的字。留著：換下一份歌詞時不用再聽一次
+    heard: Option<Vec<Seg>>,
+    /// 這次播放比對不符的來源
+    text_bad: Vec<String>,
+    /// 這次播放放回來重驗的舊封鎖
+    lifted: Vec<String>,
+    /// 每份都不符、正在換回原本的歌詞：下一份不再比
+    gave_up: bool,
 }
 
 impl Song {
@@ -407,7 +470,26 @@ impl Song {
             banned: Vec::new(),
             deaf: false,
             unsure_logged: false,
+            text_todo: false,
+            clip: Clip::default(),
+            clip_spot: false,
+            spot_pending: Vec::new(),
+            listening: false,
+            heard: None,
+            text_bad: Vec::new(),
+            lifted: Vec::new(),
+            gave_up: false,
         }
+    }
+
+    /// 還要不要錄給 whisper 的聲音
+    fn wants_clip(&self) -> bool {
+        self.text_todo && self.heard.is_none() && !self.listening
+    }
+
+    /// 混音也要送過來：錄不到 Spotify 自己的聲音時才用混音
+    fn wants_mix_clip(&self) -> bool {
+        self.wants_clip() && !self.clip_spot && !spotcap::live()
     }
 
     fn synced(&self) -> Option<&Lyrics> {
@@ -416,6 +498,28 @@ impl Song {
 
     fn first_line_ms(&self) -> i64 {
         self.synced().and_then(|l| l.synced.first()).map_or(0, |l| l.t.max(0))
+    }
+}
+
+/// whisper-cli 的狀態
+struct Asr {
+    dir: PathBuf,
+    /// 給 whisper 的暫存檔放哪
+    tmp: PathBuf,
+    ready: bool,
+    installing: bool,
+    /// 下載失敗後多久再試
+    retry_at: Option<Instant>,
+    /// 同時只跑一支：它自己就佔 4 條執行緒和 800 MB
+    busy: Arc<AtomicBool>,
+    /// 跑不起來（多半缺 VC 執行階段）：這次開程式不再試，配錯退回看能量相關度
+    broken: bool,
+}
+
+impl Asr {
+    fn new(dir: PathBuf, tmp: PathBuf) -> Self {
+        let ready = verify::ready(&dir);
+        Self { dir, tmp, ready, installing: false, retry_at: None, busy: Arc::new(AtomicBool::new(false)), broken: false }
     }
 }
 
@@ -434,11 +538,13 @@ struct Worker {
     last: Option<Poll>,
     /// 比這首的第一輪輪詢先到的歌詞（設定裡剛打開時補送的那份）
     stash: Option<(String, Lyrics)>,
+    asr: Asr,
 }
 
 /// 設定關著時只把工人備好、不開執行緒，在設定裡打開時（[`set_enabled`]）才開
 pub fn start(cfg: &Config, paths: &Paths, shared: Arc<Shared>, refetch: Sender<NowPlaying>) {
     OFF.store(!cfg.lyrics_autoalign, Ordering::Relaxed);
+    VERIFY.store(cfg.lyrics_verify, Ordering::Relaxed);
     if std::env::var_os("VITRO_NO_ALIGN").is_some() {
         return;
     }
@@ -454,6 +560,7 @@ pub fn start(cfg: &Config, paths: &Paths, shared: Arc<Shared>, refetch: Sender<N
         parked: Vec::new(),
         last: None,
         stash: None,
+        asr: Asr::new(engine_dir(paths), paths.cache.join("asr")),
     });
     if enabled() {
         spawn();
@@ -472,6 +579,7 @@ fn spawn() {
         lower_priority();
         w.run(rx);
     });
+    spotcap::start();
 }
 
 fn lower_priority() {
@@ -491,19 +599,29 @@ impl Worker {
 
     fn handle(&mut self, m: Msg) {
         // 剛關掉時佇列裡還沒處理的就丟掉
-        if !enabled() {
+        if !enabled() && !matches!(m, Msg::Installed(_)) {
             return;
         }
         match m {
             Msg::Audio(q, v) => {
                 if let Some(s) = self.song.as_mut()
-                    && !s.done
+                    && (!s.done || s.wants_mix_clip())
                 {
                     s.pending.push((q, v));
                 }
             }
+            Msg::Spot(q, v) => {
+                if let Some(s) = self.song.as_mut()
+                    && s.wants_clip()
+                {
+                    s.spot_pending.push((q, v));
+                }
+            }
             Msg::Poll(p) => self.on_poll(p),
             Msg::Lyrics(id, l) => self.on_lyrics(&id, *l),
+            Msg::Heard(id, r, secs, spot) => self.on_heard(&id, r, secs, spot),
+            Msg::Installed(r) => self.on_installed(r),
+            Msg::Recheck => self.recheck(),
         }
         self.update_want();
     }
@@ -518,10 +636,11 @@ impl Worker {
     }
 
     fn update_want(&mut self) {
-        let want = self.model.is_some()
-            && self.song.as_ref().is_some_and(|s| s.local && !s.done && s.synced().is_some())
-            && self.last.as_ref().is_some_and(|p| p.playing);
-        WANT.store(want, Ordering::Relaxed);
+        let measuring = self.model.is_some();
+        let playing = self.last.as_ref().is_some_and(|p| p.playing);
+        let song = self.song.as_ref().filter(|s| playing && s.local && s.synced().is_some());
+        WANT.store(song.is_some_and(|s| (measuring && !s.done) || s.wants_mix_clip()), Ordering::Relaxed);
+        spotcap::set_want(song.is_some_and(|s| s.wants_clip()));
     }
 
     /// 要用模型了：沒有就下載（只在有歌詞要量的時候）
@@ -554,10 +673,27 @@ impl Worker {
             self.stash = Some((id.to_string(), l));
             return;
         };
+        if !s.text_bad.is_empty() && !l.has_content() {
+            self.give_up(id);
+            return;
+        }
+        if self.text_decides() && self.retest_old_bans(id, &l) {
+            return;
+        }
+        let Some(s) = self.song.as_mut() else { return };
+        let gave_up = std::mem::take(&mut s.gave_up);
+        if gave_up {
+            let mut ent = entry(&self.dir, id).unwrap_or_default();
+            ent.checked = fingerprint(&l);
+            save_entry(&self.dir, id, ent);
+        }
+        let todo = self.need_text(id, &l);
         let done = entry(&self.dir, id).is_some_and(|e| e.measured(&l));
         let msg = format!("歌詞 {id} {}/{} 量過={done}", l.source, l.provider);
+        let Some(s) = self.song.as_mut() else { return };
         s.lyrics = Some(l);
         s.done = done || s.deaf;
+        s.text_todo = todo && !s.deaf;
         self.log(&msg);
         let Some(s) = self.song.as_mut() else { return };
         // 換了一份歌詞（例如配錯後重抓）：手上的聲音拿新的歌詞重算
@@ -565,6 +701,214 @@ impl Worker {
         if s.synced().is_some() && !s.done {
             self.ensure_model();
             self.check_rough();
+        }
+        if self.song.as_ref().is_some_and(|s| s.text_todo) {
+            self.ensure_asr();
+            self.check_text();
+        }
+    }
+
+    /// 配錯交給文字判斷：引擎備好了才算，下載中或跑不起來時照舊看能量相關度
+    fn text_decides(&self) -> bool {
+        verify_on() && self.asr.ready && !self.asr.broken
+    }
+
+    /// 能量相關度封的來源常是誤判，也可能封掉逐字歌詞。播到時放回來重抓一次，讓文字判斷，
+    /// 一首只做一次。要等播到才做：重驗要聽這首的聲音
+    fn retest_old_bans(&mut self, id: &str, l: &Lyrics) -> bool {
+        let Some(mut ent) = entry(&self.dir, id).filter(|e| !e.bad.is_empty() && !e.bad_text) else { return false };
+        let now = self.shared.now.lock().ok().and_then(|g| g.clone()).filter(|t| t.id == id);
+        let (Some(t), Some(s)) = (now, self.song.as_mut().filter(|s| s.local)) else { return false };
+        if l.provider == "本機" {
+            return false;
+        }
+        s.lifted = std::mem::take(&mut ent.bad);
+        s.lyrics = None;
+        let msg = format!("重驗 {id}：放回 {}", s.lifted.join("、"));
+        save_entry(&self.dir, id, ent);
+        crate::lyrics::forget(&self.dir, id);
+        self.log(&msg);
+        let _ = self.refetch.send(t);
+        true
+    }
+
+    /// 這份歌詞要不要比對文字。本機自訂歌詞是使用者自己放的，不判
+    fn need_text(&self, id: &str, l: &Lyrics) -> bool {
+        verify_on()
+            && !self.asr.broken
+            && !l.synced.is_empty()
+            && matches!(l.source.as_str(), "word" | "synced")
+            && l.provider != "本機"
+            && entry(&self.dir, id).is_none_or(|e| e.checked != fingerprint(l))
+    }
+
+    /// 要用引擎了：沒有就在別的執行緒下載，500 MB 要好幾分鐘，這條執行緒還要收聲音
+    fn ensure_asr(&mut self) {
+        if self.asr.ready || self.asr.broken || self.asr.installing || self.asr.retry_at.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        self.asr.installing = true;
+        self.shared.toast("下載歌詞比對模型（500 MB）…");
+        let dir = self.asr.dir.clone();
+        let _ = std::thread::Builder::new().name("asr-install".into()).spawn(move || {
+            let r = verify::install(&dir).map_err(|e| format!("{e:#}"));
+            if let Some(tx) = TX.get() {
+                let _ = tx.send(Msg::Installed(r));
+            }
+        });
+    }
+
+    fn on_installed(&mut self, r: Result<(), String>) {
+        self.asr.installing = false;
+        match r {
+            Ok(()) => {
+                self.asr.ready = true;
+                self.log("比對引擎裝好了");
+                self.listen_if_ready(false);
+            }
+            Err(e) => {
+                crate::warn!("歌詞比對模型下載失敗：{e}");
+                self.shared.toast("歌詞比對模型下載失敗，30 分鐘後再試");
+                self.asr.retry_at = Some(Instant::now() + Duration::from_secs(1800));
+            }
+        }
+    }
+
+    /// 錄滿了就交給 whisper。`ending`：這首快結束了，有多少聽多少
+    fn listen_if_ready(&mut self, ending: bool) {
+        if !self.asr.ready || self.asr.busy.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(s) = self.song.as_mut() else { return };
+        if !s.wants_clip() || !(s.clip.full() || (ending && s.clip.usable())) {
+            return;
+        }
+        if s.clip.silent() {
+            s.clip = Clip::default();
+            return;
+        }
+        let Some(lang) = s.synced().map(|l| verify::lang_of(&l.synced)) else { return };
+        let clip = std::mem::take(&mut s.clip);
+        let spot = s.clip_spot;
+        s.listening = true;
+        let id = s.id.clone();
+        let (dir, tmp, busy) = (self.asr.dir.clone(), self.asr.tmp.clone(), self.asr.busy.clone());
+        busy.store(true, Ordering::Relaxed);
+        let _ = std::thread::Builder::new().name("asr".into()).spawn(move || {
+            let t = Instant::now();
+            let r = verify::listen(&dir, &tmp, &clip, lang).map_err(|e| format!("{e:#}"));
+            busy.store(false, Ordering::Relaxed);
+            if let Some(tx) = TX.get() {
+                let _ = tx.send(Msg::Heard(id, r, t.elapsed().as_secs_f32(), spot));
+            }
+        });
+    }
+
+    fn on_heard(&mut self, id: &str, r: Result<Vec<Seg>, String>, secs: f32, spot: bool) {
+        let current = self.song.as_ref().is_some_and(|s| s.id == id);
+        let segs = match r {
+            Ok(segs) => segs,
+            Err(e) => {
+                crate::warn!("whisper-cli 跑不起來：{e}");
+                self.log(&format!("聽不了 {id}：{e}"));
+                self.shared.toast("歌詞比對跑不起來，改回舊的判斷方式");
+                self.asr.broken = true;
+                for s in self.song.iter_mut().chain(self.parked.iter_mut()) {
+                    s.text_todo = false;
+                    s.listening = false;
+                }
+                return;
+            }
+        };
+        let text: String = segs.iter().flat_map(|s| s.text.chars()).take(60).collect();
+        let from = if spot { "Spotify" } else { "混音" };
+        self.log(&format!("聽到 {id} {from} {} 段，{secs:.1} 秒：{text}", segs.len()));
+        // 切走的歌留著聽到的字，切回來拿到歌詞時比（`on_lyrics`）
+        if let Some(s) = self.song.iter_mut().chain(self.parked.iter_mut()).find(|s| s.id == id) {
+            s.listening = false;
+            s.heard = Some(segs);
+        }
+        if current {
+            self.check_text();
+        }
+    }
+
+    /// 設定裡剛切換：正在播的這首重新看一次
+    fn recheck(&mut self) {
+        let Some(s) = self.song.as_ref() else { return };
+        let Some(l) = s.lyrics.clone() else { return };
+        let id = s.id.clone();
+        let todo = self.need_text(&id, &l);
+        if let Some(s) = self.song.as_mut() {
+            s.text_todo = todo && !s.deaf;
+        }
+        if todo {
+            self.ensure_asr();
+            self.check_text();
+        }
+    }
+
+    /// 聽到的字跟這份歌詞比
+    fn check_text(&mut self) {
+        let Some(s) = self.song.as_ref().filter(|s| s.text_todo) else { return };
+        let (Some(heard), Some(l)) = (s.heard.as_ref(), s.synced()) else { return };
+        let (hit, all) = verify::score(heard, &l.synced);
+        let v = verify::judge(hit, all);
+        // 放回來重驗的來源要明確通過才算平反，聽不出字不是新證據
+        let lifted = s.lifted.contains(&l.provider);
+        let (id, provider, fp) = (s.id.clone(), l.provider.clone(), fingerprint(l));
+        self.log(&format!("比對 {id} {provider} {hit}/{all} {v:?}"));
+        if v == Verdict::Mismatch || (lifted && v != Verdict::Pass) {
+            self.text_wrong(&id, &provider);
+            return;
+        }
+        let mut ent = entry(&self.dir, &id).unwrap_or_default();
+        ent.checked = fp;
+        save_entry(&self.dir, &id, ent);
+        if let Some(s) = self.song.as_mut() {
+            s.text_todo = false;
+        }
+    }
+
+    /// 字對不上：記下這個來源，叫歌詞執行緒重抓（會跳過它）。聽到的字留著，下一份馬上能比
+    fn text_wrong(&mut self, id: &str, provider: &str) {
+        let now = self.shared.now.lock().ok().and_then(|g| g.clone()).filter(|t| t.id == id);
+        let mut ent = entry(&self.dir, id).unwrap_or_default();
+        if !ent.bad.iter().any(|b| b == provider) {
+            ent.bad.push(provider.to_string());
+        }
+        ent.bad_text = true;
+        save_entry(&self.dir, id, ent);
+        if let Some(t) = now {
+            self.shared.toast("這份歌詞好像不是這首歌，換別的來源");
+            let _ = self.refetch.send(t);
+        }
+        if let Some(s) = self.song.as_mut() {
+            s.text_bad.push(provider.to_string());
+            s.lyrics = None;
+        }
+    }
+
+    /// 每個來源都不符：多半是這首聽不準（方言、改編、辨識不來），不是全部都錯。
+    /// 撤回這次封的來源、換回原本的歌詞，那份記成比對過，之後不再比
+    fn give_up(&mut self, id: &str) {
+        let Some(s) = self.song.as_mut() else { return };
+        let tried = std::mem::take(&mut s.text_bad);
+        let lifted = std::mem::take(&mut s.lifted);
+        s.gave_up = true;
+        s.lyrics = None;
+        let mut ent = entry(&self.dir, id).unwrap_or_default();
+        ent.bad.retain(|b| !tried.contains(b));
+        // 這首聽不準，推翻不了舊判斷：照舊封著，也不用再重驗
+        ent.bad.extend(lifted);
+        ent.bad_text = true;
+        save_entry(&self.dir, id, ent);
+        crate::lyrics::forget(&self.dir, id);
+        self.log(&format!("全不符 {id}：撤回 {}", tried.join("、")));
+        let now = self.shared.now.lock().ok().and_then(|g| g.clone()).filter(|t| t.id == id);
+        if let Some(t) = now {
+            self.shared.toast("每份歌詞都對不上，換回原本的");
+            let _ = self.refetch.send(t);
         }
     }
 
@@ -585,6 +929,21 @@ impl Worker {
         let ok = prev.playing && p.playing && prev.sure && p.sure && (clock(&p) - clock(&prev)).abs() <= JUMP_MS;
         let Some(s) = self.song.as_mut() else { return };
         let pending = std::mem::take(&mut s.pending);
+        let spot = std::mem::take(&mut s.spot_pending);
+        if ok {
+            let first = s.first_line_ms() as f64;
+            for (q, v) in spot {
+                let ms = prev.pos as f64 + (q as f64 - prev.q as f64) / 1e4;
+                if s.wants_clip() && ms >= first {
+                    // 開頭那幾秒可能先收到混音，那段不要
+                    if !s.clip_spot {
+                        s.clip_spot = true;
+                        s.clip = Clip::default();
+                    }
+                    s.clip.push(ms, &v);
+                }
+            }
+        }
         if !p.sure && !s.unsure_logged && !s.done {
             s.unsure_logged = true;
             let msg = format!("位置不準 {}：自然接歌、還沒學到 Spotify 早多少，先不錄", s.id);
@@ -606,6 +965,9 @@ impl Worker {
                 s.run_ms = ms;
             }
             let s = self.song.as_mut().unwrap();
+            if s.wants_mix_clip() && ms >= s.first_line_ms() as f64 {
+                s.clip.push(ms, &v);
+            }
             s.run.extend_from_slice(&v);
             if s.run.len() as f64 >= CHUNK_S * RATE * 2.0 {
                 self.flush_run();
@@ -614,6 +976,7 @@ impl Worker {
                 s.run_ms = ms + (v.len() / 2) as f64 * 1000.0 / RATE;
             }
         }
+        self.listen_if_ready(p.pos >= p.dur - 2500);
         // 快播完了就先收尾：換歌那一刻 Spotify 的位置會先歸零，等不到
         let Some(s) = self.song.as_mut() else { return };
         if p.pos < s.dur - 2500 {
@@ -680,7 +1043,7 @@ impl Worker {
         let id = s.id.clone();
         self.log(&format!("粗估 {id} {provider} X={} 峰={:.2} 信={:.2} 唱={sing}", e.x, e.peak, e.conf));
         self.song.as_mut().unwrap().rough_done = true;
-        if e.peak < WRONG_PEAK && sing >= MIN_SING_CELLS {
+        if e.peak < WRONG_PEAK && sing >= MIN_SING_CELLS && !self.text_decides() {
             self.wrong(&id, &provider);
             return;
         }
@@ -703,7 +1066,7 @@ impl Worker {
         let (id, provider, fp, word) = (s.id.clone(), l.provider.clone(), fingerprint(l), l.has_words());
         let (secs, cover) = ((cells / 100) as u32, cells as f32 / s.db.len().max(1) as f32);
         self.log(&format!("整首 {id} {provider} X={} 峰={:.2} 信={:.2} 秒={secs} 涵蓋={:.0}% 唱={sing}", e.x, e.peak, e.conf, cover * 100.0));
-        if e.peak < WRONG_PEAK && sing >= MIN_SING_CELLS {
+        if e.peak < WRONG_PEAK && sing >= MIN_SING_CELLS && !self.text_decides() {
             self.wrong(&id, &provider);
             return true;
         }
@@ -729,6 +1092,7 @@ impl Worker {
     fn finish(&mut self, s: Song) {
         self.song = Some(s);
         self.flush_run();
+        self.listen_if_ready(true);
         if self.song.as_ref().is_some_and(|s| !s.done && !s.ended) && self.final_estimate() {
             self.song = None;
             return;
@@ -801,6 +1165,7 @@ impl Worker {
         if !ent.bad.iter().any(|b| b == provider) {
             ent.bad.push(provider.to_string());
         }
+        ent.bad_text = false;
         save_entry(&self.dir, id, ent);
         self.log(&format!("配錯 {id} {provider}"));
         if let Some(t) = now {
@@ -978,6 +1343,7 @@ mod tests {
             parked: Vec::new(),
             last: None,
             stash: None,
+            asr: Asr::new(dir.join("whisper"), dir.join("asr")),
         };
         w.ensure_model();
         assert!(w.model.is_some());
@@ -1036,6 +1402,7 @@ mod tests {
             parked: Vec::new(),
             last: None,
             stash: None,
+            asr: Asr::new(dir.join("whisper"), dir.join("asr")),
         };
         let poll = |id: &str, pos: i64| Msg::Poll(Poll { q: pos as u64 * 10_000, id: id.into(), pos, playing: true, dur: 100_000, local: true, sure: true });
         w.handle(poll("a", 1000));
@@ -1091,6 +1458,7 @@ mod tests {
             parked: Vec::new(),
             last: None,
             stash: None,
+            asr: Asr::new(dir.join("whisper"), dir.join("asr")),
         };
         (w, dir, rx)
     }
@@ -1139,6 +1507,211 @@ mod tests {
             }
             let _ = std::fs::remove_dir(&d);
         }
+    }
+
+    const SONG_TEXT: &str = "春夏秋冬東南西北青紅皂白風花雪月琴棋書畫山川湖海日升月落";
+
+    fn text_lyrics(provider: &str, text: &str) -> Lyrics {
+        Lyrics {
+            synced: vec![Line { t: 5000, text: text.into(), ..Default::default() }],
+            source: "synced".into(),
+            provider: provider.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 聽到這首唱 `SONG_TEXT`，手上是 `wrong` 這份歌詞
+    fn heard_song(w: &mut Worker, wrong: Lyrics) {
+        // 不要真的去下載人聲模型
+        w.retry_at = Some(Instant::now() + Duration::from_secs(3600));
+        w.handle(Msg::Poll(Poll { q: 10_000_000, id: "a".into(), pos: 1000, playing: true, dur: 100_000, local: true, sure: true }));
+        let s = w.song.as_mut().unwrap();
+        s.lyrics = Some(wrong);
+        s.text_todo = true;
+        s.listening = true;
+        let seg = Seg { t: 5000.0, e: 8000.0, text: SONG_TEXT.into() };
+        w.handle(Msg::Heard("a".into(), Ok(vec![seg]), 8.0, true));
+    }
+
+    #[test]
+    fn 字對不上就封來源_聽到的字留給下一份比() {
+        let (mut w, dir, _rx) = worker("text");
+        heard_song(&mut w, text_lyrics("QQ Music", "完全不一樣的另一首歌詞"));
+        assert_eq!(entry(&dir, "a").unwrap().bad, ["QQ Music"]);
+        let s = w.song.as_mut().unwrap();
+        assert!(s.lyrics.is_none(), "等重抓的下一份");
+        assert!(s.heard.is_some(), "不用再聽一次");
+        assert!(s.text_todo);
+        let right = text_lyrics("KuGou", SONG_TEXT);
+        s.lyrics = Some(right.clone());
+        w.check_text();
+        let e = entry(&dir, "a").unwrap();
+        assert_eq!(e.checked, fingerprint(&right), "記下來，之後不再比");
+        assert_eq!(e.bad, ["QQ Music"]);
+        assert!(!w.song.as_ref().unwrap().text_todo);
+        for n in ["align.log", STORE_FILE] {
+            let _ = std::fs::remove_file(dir.join(n));
+        }
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn 每份都不符就撤回_換回原本的之後不再比() {
+        let (mut w, dir, _rx) = worker("giveup");
+        heard_song(&mut w, text_lyrics("QQ Music", "完全不一樣的另一首歌詞"));
+        assert_eq!(w.song.as_ref().unwrap().text_bad, ["QQ Music"]);
+        let cache = dir.join("a.json");
+        std::fs::write(&cache, "{}").unwrap();
+        // 來源都跳過了，重抓回來是空的
+        w.handle(Msg::Lyrics("a".into(), Box::new(Lyrics { source: "none".into(), ..Default::default() })));
+        assert!(entry(&dir, "a").unwrap().bad.is_empty(), "這次封的都撤回");
+        assert!(!cache.exists(), "快取丟掉，照來源鏈重抓");
+        let first = text_lyrics("QQ Music", "完全不一樣的另一首歌詞");
+        w.handle(Msg::Lyrics("a".into(), Box::new(first.clone())));
+        assert_eq!(entry(&dir, "a").unwrap().checked, fingerprint(&first));
+        assert!(!w.song.as_ref().unwrap().text_todo);
+        for n in ["align.log", STORE_FILE] {
+            let _ = std::fs::remove_file(dir.join(n));
+        }
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    fn now_a() -> NowPlaying {
+        NowPlaying {
+            playing: true,
+            id: "a".into(),
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            album_uri: String::new(),
+            art: crate::player::Art::SmtcThumb,
+            duration_ms: 100_000,
+            progress_ms: 0,
+            device: String::new(),
+            shuffle: false,
+            repeat: crate::smtc::Repeat::Off,
+            smtc_stamp: None,
+            at: Instant::now(),
+            source: "smtc",
+            track_uri: String::new(),
+            volume: None,
+            supports_volume: true,
+        }
+    }
+
+    /// 播著 a，手上是 KuGou 這份，QQ Music 是能量相關度封的
+    fn old_ban(name: &str) -> (Worker, PathBuf, Receiver<NowPlaying>) {
+        let (mut w, dir, rx) = worker(name);
+        w.retry_at = Some(Instant::now() + Duration::from_secs(3600));
+        save_entry(&dir, "a", Entry { bad: vec!["QQ Music".into()], ..Default::default() });
+        *w.shared.now.lock().unwrap() = Some(now_a());
+        w.handle(Msg::Poll(Poll { q: 10_000_000, id: "a".into(), pos: 1000, playing: true, dur: 100_000, local: true, sure: true }));
+        std::fs::write(dir.join("a.json"), "{}").unwrap();
+        assert!(w.retest_old_bans("a", &text_lyrics("KuGou", SONG_TEXT)));
+        assert!(entry(&dir, "a").unwrap().bad.is_empty(), "放回來");
+        assert!(!dir.join("a.json").exists(), "快取丟掉，照來源鏈重抓");
+        assert_eq!(rx.try_iter().count(), 1);
+        (w, dir, rx)
+    }
+
+    fn cleanup(dir: &Path) {
+        for n in ["align.log", STORE_FILE] {
+            let _ = std::fs::remove_file(dir.join(n));
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn 舊封鎖重驗_通過就平反() {
+        let (mut w, dir, _rx) = old_ban("retest-pass");
+        let qq = text_lyrics("QQ Music", SONG_TEXT);
+        let s = w.song.as_mut().unwrap();
+        s.lyrics = Some(qq.clone());
+        s.text_todo = true;
+        s.heard = Some(vec![Seg { t: 5000.0, e: 8000.0, text: SONG_TEXT.into() }]);
+        w.check_text();
+        let e = entry(&dir, "a").unwrap();
+        assert!(e.bad.is_empty());
+        assert_eq!(e.checked, fingerprint(&qq));
+        assert!(!w.retest_old_bans("a", &qq), "只做一次");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn 舊封鎖重驗_聽不出字就封回去() {
+        let (mut w, dir, rx) = old_ban("retest-unsure");
+        let qq = text_lyrics("QQ Music", "任何歌詞");
+        let s = w.song.as_mut().unwrap();
+        s.lyrics = Some(qq.clone());
+        s.text_todo = true;
+        s.heard = Some(vec![Seg { t: 5000.0, e: 6000.0, text: " you".into() }]);
+        w.check_text();
+        let e = entry(&dir, "a").unwrap();
+        assert_eq!(e.bad, ["QQ Music"]);
+        assert!(e.bad_text);
+        assert_eq!(rx.try_iter().count(), 1, "換下一份");
+        assert!(!w.retest_old_bans("a", &qq), "不會每次播都重驗");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn 舊封鎖重驗_全不符時維持原封鎖() {
+        let (mut w, dir, _rx) = old_ban("retest-giveup");
+        let s = w.song.as_mut().unwrap();
+        s.text_bad = vec!["QQ Music".into(), "KuGou".into()];
+        w.give_up("a");
+        let e = entry(&dir, "a").unwrap();
+        assert_eq!(e.bad, ["QQ Music"], "KuGou 撤回，QQ Music 照舊");
+        assert!(e.bad_text);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn 舊封鎖重驗_別的裝置在放就不動() {
+        let (mut w, dir, rx) = worker("retest-remote");
+        save_entry(&dir, "a", Entry { bad: vec!["QQ Music".into()], ..Default::default() });
+        *w.shared.now.lock().unwrap() = Some(now_a());
+        w.handle(Msg::Poll(Poll { q: 10_000_000, id: "a".into(), pos: 1000, playing: true, dur: 100_000, local: false, sure: true }));
+        assert!(!w.retest_old_bans("a", &text_lyrics("KuGou", SONG_TEXT)));
+        assert_eq!(entry(&dir, "a").unwrap().bad, ["QQ Music"]);
+        assert_eq!(rx.try_iter().count(), 0);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn 聽不出東西不算配錯() {
+        let (mut w, dir, _rx) = worker("unsure-text");
+        heard_song(&mut w, text_lyrics("QQ Music", "任何歌詞"));
+        // 上面聽到的字夠多會判不符；這裡換成幾乎沒聽到
+        let (mut w2, dir2, _rx2) = worker("unsure-text2");
+        w2.handle(Msg::Poll(Poll { q: 10_000_000, id: "a".into(), pos: 1000, playing: true, dur: 100_000, local: true, sure: true }));
+        let s = w2.song.as_mut().unwrap();
+        s.lyrics = Some(text_lyrics("QQ Music", "任何歌詞"));
+        s.text_todo = true;
+        w2.handle(Msg::Heard("a".into(), Ok(vec![Seg { t: 5000.0, e: 6000.0, text: " you".into() }]), 8.0, true));
+        assert!(entry(&dir2, "a").unwrap().bad.is_empty());
+        assert!(w2.song.as_ref().unwrap().lyrics.is_some(), "歌詞不動");
+        for d in [dir, dir2] {
+            for n in ["align.log", STORE_FILE] {
+                let _ = std::fs::remove_file(d.join(n));
+            }
+            let _ = std::fs::remove_dir(&d);
+        }
+    }
+
+    #[test]
+    fn 引擎跑不起來就退回舊判斷() {
+        let (mut w, dir, _rx) = worker("broken");
+        w.handle(Msg::Poll(Poll { q: 10_000_000, id: "a".into(), pos: 1000, playing: true, dur: 100_000, local: true, sure: true }));
+        let s = w.song.as_mut().unwrap();
+        s.text_todo = true;
+        s.listening = true;
+        w.handle(Msg::Heard("a".into(), Err("結束代碼 -1073741515".into()), 0.1, false));
+        assert!(w.asr.broken);
+        assert!(!w.text_decides());
+        assert!(!w.song.as_ref().unwrap().wants_clip());
+        let _ = std::fs::remove_file(dir.join("align.log"));
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
