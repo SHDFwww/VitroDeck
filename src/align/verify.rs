@@ -68,7 +68,7 @@ pub enum Verdict {
 }
 
 /// 轉繁體後的字詞：英文數字一個詞一個，其他一個字一個
-fn tokens(s: &str) -> Vec<String> {
+pub(super) fn tokens(s: &str) -> Vec<String> {
     let s: String = crate::zh::s2tw(s).nfkc().flat_map(char::to_lowercase).collect();
     let mut out = Vec::new();
     let mut word = String::new();
@@ -212,28 +212,32 @@ impl Clip {
         p.map_or(ms, |&(i, start)| start + ms - i as f64 * 1000.0 / ASR_RATE as f64)
     }
 
-    /// 響度拉到滿，音量開得小也一樣聽得到
     fn wav(&self) -> Vec<u8> {
-        let peak = self.pcm.iter().fold(1e-6f32, |p, x| p.max(x.abs()));
-        let len = self.pcm.len() as u32 * 2;
-        let mut w = Vec::with_capacity(44 + len as usize);
-        w.extend_from_slice(b"RIFF");
-        w.extend_from_slice(&(36 + len).to_le_bytes());
-        w.extend_from_slice(b"WAVEfmt ");
-        w.extend_from_slice(&16u32.to_le_bytes());
-        w.extend_from_slice(&1u16.to_le_bytes());
-        w.extend_from_slice(&1u16.to_le_bytes());
-        w.extend_from_slice(&(ASR_RATE as u32).to_le_bytes());
-        w.extend_from_slice(&(ASR_RATE as u32 * 2).to_le_bytes());
-        w.extend_from_slice(&2u16.to_le_bytes());
-        w.extend_from_slice(&16u16.to_le_bytes());
-        w.extend_from_slice(b"data");
-        w.extend_from_slice(&len.to_le_bytes());
-        for x in &self.pcm {
-            w.extend_from_slice(&((x / peak * 0.9 * 32767.0) as i16).to_le_bytes());
-        }
-        w
+        wav_bytes(&self.pcm)
     }
+}
+
+/// 16 kHz 單聲道 WAV。響度拉到滿，音量開得小也一樣聽得到
+pub(super) fn wav_bytes(pcm: &[f32]) -> Vec<u8> {
+    let peak = pcm.iter().fold(1e-6f32, |p, x| p.max(x.abs()));
+    let len = pcm.len() as u32 * 2;
+    let mut w = Vec::with_capacity(44 + len as usize);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + len).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&(ASR_RATE as u32).to_le_bytes());
+    w.extend_from_slice(&(ASR_RATE as u32 * 2).to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&len.to_le_bytes());
+    for x in pcm {
+        w.extend_from_slice(&((x / peak * 0.9 * 32767.0) as i16).to_le_bytes());
+    }
+    w
 }
 
 // ---------------------------- whisper-cli ----------------------------
@@ -268,8 +272,8 @@ struct CliOffsets {
     to: f64,
 }
 
-/// 跑一次 whisper-cli。回傳的時間是 `clip` 裡的毫秒
-fn run_cli(dir: &Path, wav: &Path, lang: &str) -> anyhow::Result<CliOut> {
+/// 跑一次 whisper-cli，回傳 JSON 文字。`args` 是除了模型、輸入檔、輸出檔以外的參數
+fn run_raw(dir: &Path, wav: &Path, args: &[&str]) -> anyhow::Result<String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
@@ -281,7 +285,8 @@ fn run_cli(dir: &Path, wav: &Path, lang: &str) -> anyhow::Result<CliOut> {
         .arg(dir.join(MODEL_FILE))
         .arg("-f")
         .arg(wav)
-        .args(["-l", lang, "-t", THREADS, "-oj", "-np", "-nt", "-of"])
+        .args(args)
+        .arg("-of")
         .arg(&base)
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
@@ -308,7 +313,69 @@ fn run_cli(dir: &Path, wav: &Path, lang: &str) -> anyhow::Result<CliOut> {
     // 中日文可能被切在位元組中間，不是合法的 UTF-8
     let text = String::from_utf8_lossy(&std::fs::read(&json).context("沒有輸出")?).into_owned();
     let _ = std::fs::remove_file(&json);
+    Ok(text)
+}
+
+/// 跑一次 whisper-cli。回傳的時間是 `clip` 裡的毫秒
+fn run_cli(dir: &Path, wav: &Path, lang: &str) -> anyhow::Result<CliOut> {
+    let text = run_raw(dir, wav, &["-l", lang, "-t", THREADS, "-oj", "-np", "-nt"])?;
     serde_json::from_str(&text).context("輸出讀不懂")
+}
+
+/// whisper 聽到的一個詞元（token）。時間是這段聲音裡的毫秒
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tok {
+    pub text: String,
+    pub from: f64,
+    pub to: f64,
+    /// DTW 對出來的時間（比 `from` 準，要關 flash attention 才有）
+    pub dtw: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct FullOut {
+    #[serde(default)]
+    transcription: Vec<FullSeg>,
+}
+
+#[derive(Deserialize)]
+struct FullSeg {
+    #[serde(default)]
+    tokens: Vec<FullTok>,
+}
+
+#[derive(Deserialize)]
+struct FullTok {
+    text: String,
+    offsets: CliOffsets,
+    #[serde(default = "no_dtw")]
+    t_dtw: i64,
+}
+
+fn no_dtw() -> i64 {
+    -1
+}
+
+/// `-ojf` 的輸出攤平成詞元。`t_dtw` 的單位是 10 ms
+pub fn parse_tokens(json: &str) -> anyhow::Result<Vec<Tok>> {
+    let out: FullOut = serde_json::from_str(json).context("輸出讀不懂")?;
+    Ok(out
+        .transcription
+        .into_iter()
+        .flat_map(|s| s.tokens)
+        .map(|t| Tok { text: t.text, from: t.offsets.from, to: t.offsets.to, dtw: (t.t_dtw >= 0).then_some(t.t_dtw as f64 * 10.0) })
+        .collect())
+}
+
+/// 逐字時間用的聽寫：一段 16 kHz 單聲道（`wav_bytes` 的輸出），語言照歌詞的字判斷。
+/// DTW 一定要關 flash attention，不然每個詞元的 DTW 時間都是 -1
+pub fn listen_words(dir: &Path, tmp: &Path, wav_data: &[u8], lang: &str) -> anyhow::Result<Vec<Tok>> {
+    std::fs::create_dir_all(tmp)?;
+    let wav = tmp.join("fill.wav");
+    std::fs::write(&wav, wav_data)?;
+    let got = run_raw(dir, &wav, &["-l", lang, "-t", THREADS, "-ojf", "-dtw", "small", "-nfa", "-np"]);
+    let _ = std::fs::remove_file(&wav);
+    parse_tokens(&got?)
 }
 
 /// 聽寫。語言自動判斷，判成這幾種以外就用 `lang` 重跑

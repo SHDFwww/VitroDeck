@@ -10,9 +10,11 @@
 //! 每滿 30 秒跑一次模型。量的是對「畫面用的位置」（已扣 lead.rs），所以 X 就是歌詞本身差多少。
 //!
 //! 結果存在歌詞資料夾的 `align.json`，以歌詞的時間指紋為準：同一份歌詞量過就不再錄。
-//! 手動的單曲微調（`offsets.json`）優先。逐句歌詞故意早約 0.3 秒讓句子先出現（使用者決定先保留），
-//! 所以逐句只修大錯、而且修完仍保留這 0.3 秒。
+//! 手動的單曲微調（`offsets.json`）優先。逐句歌詞一致早約 0.3 秒（LRC 習慣），2026-11-08 起也修掉：
+//! 離線把 29 首酷狗逐字降成逐句，用同樣的人聲能量估出的偏移，信心 ≥ 0.03 的 17 首跟逐字遮罩估的差都在 ±140 ms 內
+//! （中位 30 ms），所以逐句的門檻是信心 ≥ 0.03、差 ≥ 150 ms 就整個修掉，不再保留 0.3 秒。
 
+mod fill;
 mod spotcap;
 pub mod umx;
 pub mod verify;
@@ -63,9 +65,9 @@ const PARKED: usize = 4;
 const MIN_SING_CELLS: usize = 1500;
 /// 差多少才修。酷狗逐字本身多在 ±130 ms 內，修那個只是在追雜訊
 const APPLY_WORD_MS: i64 = 250;
-const APPLY_LINE_MS: i64 = 600;
-/// 逐句歌詞量到的固定早（6 首 +33～+388），修大錯時保留
-const LINE_LEAD_MS: i64 = 300;
+const APPLY_LINE_MS: i64 = 150;
+/// 逐句的遮罩只知道句首，估得比逐字粗：信心要更高才修（離線 17 首信心 ≥ 0.03 的都在 ±140 ms 內，0.02 的有差 660 ms 的）
+const LINE_CONF: f32 = 0.03;
 /// 太靠搜尋邊界的峰不可信
 const MAX_APPLY_MS: i64 = 3500;
 /// 人聲能量最響的 5% 跟第 20 百分位差不到這麼多（dB），就是聽不出誰在唱（整段靜音之類），不估
@@ -79,6 +81,8 @@ static WANT: AtomicBool = AtomicBool::new(false);
 static OFF: AtomicBool = AtomicBool::new(false);
 /// 比對歌詞內容（`verify`）。關著時不下載、不聽，配錯照舊看能量相關度
 static VERIFY: AtomicBool = AtomicBool::new(false);
+/// 逐句歌詞補成逐字（`fill`）。關著時不錄整首、不聽、也不把存的逐字套到歌詞上
+static FILL: AtomicBool = AtomicBool::new(false);
 /// 備好還沒開執行緒的工人（設定關著啟動的）
 static IDLE: Mutex<Option<Worker>> = Mutex::new(None);
 static TX: OnceLock<SyncSender<Msg>> = OnceLock::new();
@@ -92,7 +96,9 @@ enum Msg {
     /// whisper 聽完了：哪首、聽到什麼、花幾秒、聽的是不是只有 Spotify 的聲音
     Heard(String, Result<Vec<Seg>, String>, f32, bool),
     Installed(Result<(), String>),
-    /// 比對的開關切了
+    /// 逐字補好了：哪首、歌詞的句子時間指紋、句數、結果
+    Filled(String, u64, usize, Result<fill::Outcome, String>),
+    /// 比對或逐字補全的開關切了
     Recheck,
 }
 
@@ -137,6 +143,29 @@ pub fn set_verify(on: bool) {
     VERIFY.store(on, Ordering::Relaxed);
     if let Some(tx) = TX.get() {
         let _ = tx.try_send(Msg::Recheck);
+    }
+}
+
+fn fill_on() -> bool {
+    FILL.load(Ordering::Relaxed) && enabled()
+}
+
+/// 設定視窗切換「逐句歌詞補成逐字」時呼叫
+pub fn set_wordfill(on: bool) {
+    FILL.store(on, Ordering::Relaxed);
+    if let Some(tx) = TX.get() {
+        let _ = tx.try_send(Msg::Recheck);
+    }
+}
+
+/// 歌詞執行緒抓到歌詞後呼叫：只有逐句的歌，把之前補好的逐字時間套上去
+pub fn fill_words(dir: &Path, key: &str, l: &mut Lyrics) {
+    if fill_on()
+        && l.source == "synced"
+        && l.provider != "本機"
+        && let Some(st) = fill::load(dir, key)
+    {
+        fill::apply(l, &st);
     }
 }
 
@@ -253,7 +282,8 @@ pub fn fingerprint(l: &Lyrics) -> u64 {
     };
     for ln in &l.synced {
         eat(ln.t);
-        for w in ln.words.iter().flatten() {
+        // 補出來的逐字是疊上去的，不能改變指紋（不然補完之後量過的偏移就失效）
+        for w in ln.words.iter().filter(|_| !l.filled).flatten() {
             eat(w.t);
             eat(w.d);
         }
@@ -271,6 +301,12 @@ impl Entry {
     fn measured(&self, l: &Lyrics) -> bool {
         self.fp == fingerprint(l) && !self.bad.contains(&l.provider) && trusted(self.secs, self.cover, self.conf)
     }
+
+    /// 要套用的偏移，每次照存的 X 重算（改門檻之後舊紀錄跟著生效，不用重錄）
+    fn derive(&self, word: bool) -> i64 {
+        let need = if word { FINAL_CONF } else { LINE_CONF };
+        if self.conf >= need { decide(&Est { x: self.x, peak: self.peak, conf: self.conf }, word) } else { 0 }
+    }
 }
 
 /// 套用的偏移：這份歌詞量過、而且不是配錯的
@@ -278,7 +314,7 @@ pub fn auto_shift(dir: &Path, key: &str, l: &Lyrics) -> i64 {
     if !enabled() {
         return 0;
     }
-    entry(dir, key).filter(|e| e.measured(l)).map_or(0, |e| e.apply)
+    entry(dir, key).filter(|e| e.measured(l)).map_or(0, |e| e.derive(l.native_words()))
 }
 
 // ---------------------------- 估計 ----------------------------
@@ -301,7 +337,7 @@ fn expected_mask(l: &Lyrics, n: usize) -> Vec<f32> {
     };
     let lines: Vec<_> = l.synced.iter().filter(|x| !x.text.trim().is_empty()).collect();
     for (i, ln) in lines.iter().enumerate() {
-        match ln.words.as_ref().filter(|w| !w.is_empty()) {
+        match ln.words.as_ref().filter(|w| !w.is_empty() && !l.filled) {
             Some(ws) => {
                 for w in ws {
                     set(w.t, w.t + w.d.max(80));
@@ -383,8 +419,8 @@ fn decide(e: &Est, word: bool) -> i64 {
     }
     if word {
         if e.x.abs() >= APPLY_WORD_MS { -e.x } else { 0 }
-    } else if (e.x - LINE_LEAD_MS).abs() >= APPLY_LINE_MS {
-        -(e.x - LINE_LEAD_MS)
+    } else if e.x.abs() >= APPLY_LINE_MS {
+        -e.x
     } else {
         0
     }
@@ -451,6 +487,10 @@ struct Song {
     lifted: Vec<String>,
     /// 每份都不符、正在換回原本的歌詞：下一份不再比
     gave_up: bool,
+    /// 這首要錄整首給逐字補全用（`fill`）
+    fill_todo: bool,
+    /// 整首的 Spotify 聲音，換歌時連同歌詞交給背景去聽
+    fill: Option<fill::Rec>,
 }
 
 impl Song {
@@ -479,12 +519,19 @@ impl Song {
             text_bad: Vec::new(),
             lifted: Vec::new(),
             gave_up: false,
+            fill_todo: false,
+            fill: None,
         }
     }
 
     /// 還要不要錄給 whisper 的聲音
     fn wants_clip(&self) -> bool {
         self.text_todo && self.heard.is_none() && !self.listening
+    }
+
+    /// 還要不要錄整首的 Spotify 聲音
+    fn wants_fill(&self) -> bool {
+        self.fill_todo && !self.deaf
     }
 
     /// 混音也要送過來：錄不到 Spotify 自己的聲音時才用混音
@@ -539,12 +586,15 @@ struct Worker {
     /// 比這首的第一輪輪詢先到的歌詞（設定裡剛打開時補送的那份）
     stash: Option<(String, Lyrics)>,
     asr: Asr,
+    /// 錄好、等著聽的整首聲音（引擎還沒好或正在聽別的）
+    fill_jobs: Vec<fill::Job>,
 }
 
 /// 設定關著時只把工人備好、不開執行緒，在設定裡打開時（[`set_enabled`]）才開
 pub fn start(cfg: &Config, paths: &Paths, shared: Arc<Shared>, refetch: Sender<NowPlaying>) {
     OFF.store(!cfg.lyrics_autoalign, Ordering::Relaxed);
     VERIFY.store(cfg.lyrics_verify, Ordering::Relaxed);
+    FILL.store(cfg.lyrics_wordfill, Ordering::Relaxed);
     if std::env::var_os("VITRO_NO_ALIGN").is_some() {
         return;
     }
@@ -561,6 +611,7 @@ pub fn start(cfg: &Config, paths: &Paths, shared: Arc<Shared>, refetch: Sender<N
         last: None,
         stash: None,
         asr: Asr::new(engine_dir(paths), paths.cache.join("asr")),
+        fill_jobs: Vec::new(),
     });
     if enabled() {
         spawn();
@@ -612,7 +663,7 @@ impl Worker {
             }
             Msg::Spot(q, v) => {
                 if let Some(s) = self.song.as_mut()
-                    && s.wants_clip()
+                    && (s.wants_clip() || s.wants_fill())
                 {
                     s.spot_pending.push((q, v));
                 }
@@ -621,8 +672,10 @@ impl Worker {
             Msg::Lyrics(id, l) => self.on_lyrics(&id, *l),
             Msg::Heard(id, r, secs, spot) => self.on_heard(&id, r, secs, spot),
             Msg::Installed(r) => self.on_installed(r),
+            Msg::Filled(id, fp, n, r) => self.on_filled(&id, fp, n, r),
             Msg::Recheck => self.recheck(),
         }
+        self.pump_fill();
         self.update_want();
     }
 
@@ -640,7 +693,7 @@ impl Worker {
         let playing = self.last.as_ref().is_some_and(|p| p.playing);
         let song = self.song.as_ref().filter(|s| playing && s.local && s.synced().is_some());
         WANT.store(song.is_some_and(|s| (measuring && !s.done) || s.wants_mix_clip()), Ordering::Relaxed);
-        spotcap::set_want(song.is_some_and(|s| s.wants_clip()));
+        spotcap::set_want(song.is_some_and(|s| s.wants_clip() || s.wants_fill()));
     }
 
     /// 要用模型了：沒有就下載（只在有歌詞要量的時候）
@@ -688,12 +741,14 @@ impl Worker {
             save_entry(&self.dir, id, ent);
         }
         let todo = self.need_text(id, &l);
+        let fill_todo = self.need_fill(id, &l);
         let done = entry(&self.dir, id).is_some_and(|e| e.measured(&l));
         let msg = format!("歌詞 {id} {}/{} 量過={done}", l.source, l.provider);
         let Some(s) = self.song.as_mut() else { return };
         s.lyrics = Some(l);
         s.done = done || s.deaf;
         s.text_todo = todo && !s.deaf;
+        s.fill_todo = fill_todo && s.local;
         self.log(&msg);
         let Some(s) = self.song.as_mut() else { return };
         // 換了一份歌詞（例如配錯後重抓）：手上的聲音拿新的歌詞重算
@@ -702,8 +757,10 @@ impl Worker {
             self.ensure_model();
             self.check_rough();
         }
-        if self.song.as_ref().is_some_and(|s| s.text_todo) {
+        if self.song.as_ref().is_some_and(|s| s.text_todo || s.fill_todo) {
             self.ensure_asr();
+        }
+        if self.song.as_ref().is_some_and(|s| s.text_todo) {
             self.check_text();
         }
     }
@@ -740,6 +797,16 @@ impl Worker {
             && matches!(l.source.as_str(), "word" | "synced")
             && l.provider != "本機"
             && entry(&self.dir, id).is_none_or(|e| e.checked != fingerprint(l))
+    }
+
+    /// 這份歌詞要不要錄整首來補逐字：只有逐句、不是本機自訂，而且還沒補完
+    fn need_fill(&self, id: &str, l: &Lyrics) -> bool {
+        fill_on()
+            && !self.asr.broken
+            && l.source == "synced"
+            && l.provider != "本機"
+            && !l.synced.is_empty()
+            && fill::wanted(fill::load(&self.dir, id).as_ref(), &l.synced)
     }
 
     /// 要用引擎了：沒有就在別的執行緒下載，500 MB 要好幾分鐘，這條執行緒還要收聲音
@@ -839,11 +906,18 @@ impl Worker {
         let Some(l) = s.lyrics.clone() else { return };
         let id = s.id.clone();
         let todo = self.need_text(&id, &l);
+        let fill_todo = self.need_fill(&id, &l);
         if let Some(s) = self.song.as_mut() {
             s.text_todo = todo && !s.deaf;
+            s.fill_todo = fill_todo && s.local;
+            if !fill_todo {
+                s.fill = None;
+            }
+        }
+        if todo || fill_todo {
+            self.ensure_asr();
         }
         if todo {
-            self.ensure_asr();
             self.check_text();
         }
     }
@@ -942,6 +1016,10 @@ impl Worker {
                     }
                     s.clip.push(ms, &v);
                 }
+                if s.wants_fill() {
+                    let dur = s.dur;
+                    s.fill.get_or_insert_with(|| fill::Rec::new(dur)).push(ms, &v);
+                }
             }
         }
         if !p.sure && !s.unsure_logged && !s.done {
@@ -1038,7 +1116,7 @@ impl Worker {
         let db: Vec<f32> = s.db.iter().enumerate().map(|(i, &v)| if i < until { v } else { f32::NAN }).collect();
         let sing = db.iter().zip(&mask).filter(|(v, m)| !v.is_nan() && **m > 0.0).count();
         let Some(e) = estimate(&db, &mask) else { return };
-        let word = l.has_words();
+        let word = l.native_words();
         let provider = l.provider.clone();
         let id = s.id.clone();
         self.log(&format!("粗估 {id} {provider} X={} 峰={:.2} 信={:.2} 唱={sing}", e.x, e.peak, e.conf));
@@ -1063,7 +1141,7 @@ impl Worker {
         let mask = expected_mask(l, s.db.len());
         let sing = s.db.iter().zip(&mask).filter(|(v, m)| !v.is_nan() && **m > 0.0).count();
         let Some(e) = estimate(&s.db, &mask) else { return false };
-        let (id, provider, fp, word) = (s.id.clone(), l.provider.clone(), fingerprint(l), l.has_words());
+        let (id, provider, fp, word) = (s.id.clone(), l.provider.clone(), fingerprint(l), l.native_words());
         let (secs, cover) = ((cells / 100) as u32, cells as f32 / s.db.len().max(1) as f32);
         self.log(&format!("整首 {id} {provider} X={} 峰={:.2} 信={:.2} 秒={secs} 涵蓋={:.0}% 唱={sing}", e.x, e.peak, e.conf, cover * 100.0));
         if e.peak < WRONG_PEAK && sing >= MIN_SING_CELLS && !self.text_decides() {
@@ -1075,7 +1153,7 @@ impl Worker {
             self.log(&format!("不存 {id}：只錄到一部分、證據不夠"));
             return false;
         }
-        let apply = if e.conf >= FINAL_CONF { decide(&e, word) } else { 0 };
+        let apply = if e.conf >= if word { FINAL_CONF } else { LINE_CONF } { decide(&e, word) } else { 0 };
         let mut ent = entry(&self.dir, &id).unwrap_or_default();
         ent.fp = fp;
         ent.x = e.x;
@@ -1091,6 +1169,7 @@ impl Worker {
 
     fn finish(&mut self, s: Song) {
         self.song = Some(s);
+        self.hand_off_fill();
         self.flush_run();
         self.listen_if_ready(true);
         if self.song.as_ref().is_some_and(|s| !s.done && !s.ended) && self.final_estimate() {
@@ -1108,6 +1187,74 @@ impl Worker {
         if self.parked.len() > PARKED {
             self.parked.remove(0);
         }
+    }
+
+    /// 這首要走了：整首的 Spotify 聲音連同歌詞交給背景去聽。錄到的不夠就算了（下次播再錄）
+    fn hand_off_fill(&mut self) {
+        let Some(s) = self.song.as_mut() else { return };
+        let rec = s.fill.take();
+        let (Some(rec), Some(l), true) = (rec, s.lyrics.as_ref(), s.fill_todo) else { return };
+        let id = s.id.clone();
+        let job = fill::Job {
+            id: id.clone(),
+            lines: l.synced.iter().map(|x| (x.t, x.text.clone())).collect(),
+            fp: fill::lines_fp(&l.synced),
+            rec,
+            lang: verify::lang_of(&l.synced),
+        };
+        s.fill_todo = false;
+        if !job.worth() {
+            self.log(&format!("逐字 {id}：錄到的不夠，下次再錄"));
+            return;
+        }
+        self.fill_jobs.push(job);
+        // 引擎遲遲沒好時別堆太多（每首約 15 MB）
+        if self.fill_jobs.len() > 2 {
+            self.fill_jobs.remove(0);
+        }
+    }
+
+    /// 引擎好了又閒著，就聽下一首。要聽好幾段，每段約 6 秒，所以放在別的執行緒
+    fn pump_fill(&mut self) {
+        if !fill_on() {
+            self.fill_jobs.clear();
+            return;
+        }
+        if self.fill_jobs.is_empty() || !self.asr.ready || self.asr.broken || self.asr.busy.load(Ordering::Relaxed) {
+            return;
+        }
+        let job = self.fill_jobs.remove(0);
+        self.log(&format!("逐字 {}：開始聽，{} 句", job.id, job.lines.len()));
+        let (dir, tmp, busy) = (self.asr.dir.clone(), self.asr.tmp.clone(), self.asr.busy.clone());
+        busy.store(true, Ordering::Relaxed);
+        let _ = std::thread::Builder::new().name("fill".into()).spawn(move || {
+            let r = fill::run(&dir, &tmp, &job).map_err(|e| format!("{e:#}"));
+            busy.store(false, Ordering::Relaxed);
+            if let Some(tx) = TX.get() {
+                let _ = tx.send(Msg::Filled(job.id.clone(), job.fp, job.lines.len(), r));
+            }
+        });
+    }
+
+    fn on_filled(&mut self, id: &str, fp: u64, n: usize, r: Result<fill::Outcome, String>) {
+        let old = fill::load(&self.dir, id);
+        let out = match r {
+            Ok(o) => {
+                let done = o.lines.iter().filter(|l| !l.is_empty()).count();
+                self.log(&format!("逐字 {id}：補 {done}/{n} 句，聽了 {}/{} 段，字對到 {}/{}，句首 {} 句，偏晚 {} ms", o.chunks[0], o.chunks[1], o.matched, o.units, o.heads, o.bias));
+                Some(o)
+            }
+            Err(e) => {
+                self.log(&format!("逐字 {id}：沒補成：{e}"));
+                if e.contains("開不起來") {
+                    crate::warn!("whisper-cli 跑不起來：{e}");
+                    self.shared.toast("逐句補逐字跑不起來");
+                    self.asr.broken = true;
+                }
+                None
+            }
+        };
+        fill::save(&self.dir, id, fill::merge(old, fp, n, out));
     }
 
     /// 切回沒量完的歌
@@ -1276,8 +1423,9 @@ mod tests {
         let e = |x, peak| Est { x, peak, conf: 0.1 };
         assert_eq!(decide(&e(120, 0.6), true), 0, "逐字差一點不修");
         assert_eq!(decide(&e(-2000, 0.6), true), 2000);
-        assert_eq!(decide(&e(330, 0.6), false), 0, "逐句的固定早保留");
-        assert_eq!(decide(&e(2300, 0.6), false), -2000, "逐句大錯修到剩 0.3 秒");
+        assert_eq!(decide(&e(120, 0.6), false), 0, "逐句差一點不修");
+        assert_eq!(decide(&e(330, 0.6), false), -330, "逐句的固定早也修掉");
+        assert_eq!(decide(&e(-2300, 0.6), false), 2300);
         assert_eq!(decide(&e(-2000, 0.1), true), 0, "配錯不修");
         assert_eq!(decide(&e(3900, 0.6), true), 0, "太靠邊界不修");
     }
@@ -1343,6 +1491,7 @@ mod tests {
             parked: Vec::new(),
             last: None,
             stash: None,
+            fill_jobs: Vec::new(),
             asr: Asr::new(dir.join("whisper"), dir.join("asr")),
         };
         w.ensure_model();
@@ -1402,6 +1551,7 @@ mod tests {
             parked: Vec::new(),
             last: None,
             stash: None,
+            fill_jobs: Vec::new(),
             asr: Asr::new(dir.join("whisper"), dir.join("asr")),
         };
         let poll = |id: &str, pos: i64| Msg::Poll(Poll { q: pos as u64 * 10_000, id: id.into(), pos, playing: true, dur: 100_000, local: true, sure: true });
@@ -1458,6 +1608,7 @@ mod tests {
             parked: Vec::new(),
             last: None,
             stash: None,
+            fill_jobs: Vec::new(),
             asr: Asr::new(dir.join("whisper"), dir.join("asr")),
         };
         (w, dir, rx)

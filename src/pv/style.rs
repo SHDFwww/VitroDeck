@@ -574,9 +574,10 @@ impl Style {
             [r, g, b, a]
         };
         // 同色相推出來的暗底，金、橘這類強調色會變咖啡色。墊得夠厚，後面封面的顏色才不會把夜色染髒
-        let nh = nh.to_radians();
-        self.bg = c(0.2, 0.045 * nk, nh, 0.85);
-        self.ink = c(0.96, 0.01 * nk, nh, 1.0);
+        let nh = v2::lean(nh, h.to_degrees(), ch).to_radians();
+        self.bg = c(0.2, 0.055 * nk, nh, 0.85);
+        // 字是帶一點封面色的白：等著的、唱過的字（只靠透明度退到背景）也看得出是封面的顏色
+        self.ink = c(0.96, ch.min(0.028), h, 1.0);
         self.key_ink = Some(c(p[0].max(0.82), ch.min(0.16), h, 1.0));
         self.band = Some(c(0.6, ch.min(0.13), h, 1.0));
         self.band_ink = c(0.97, ch.min(0.01), h, 1.0);

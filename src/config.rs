@@ -105,6 +105,10 @@ pub struct Config {
     /// 開著自動對齊時，再用語音辨識比對歌詞的字來判斷配錯（見 align/verify.rs）。
     /// 第一次用時下載 whisper.cpp 與約 500 MB 的模型。預設關。Rust 版才有
     pub lyrics_verify: bool,
+    /// 只有逐句的歌詞，第一次播時錄下 Spotify 的聲音，播完在背景聽寫、把每個字的時間補出來，
+    /// 下次播就有逐字（文字 PV 才演得了）。跟 `lyrics_verify` 共用同一個引擎與模型（見 align/fill.rs）。
+    /// 預設關。Rust 版才有
+    pub lyrics_wordfill: bool,
     /// 指定 LyricsPlus 要用哪些來源。預設排除 apple —— 那條需要 Apple Music
     /// 訂閱，而實測 qq 的逐字覆蓋率反而更好（華語／西洋／日文都中）。
     pub lyricsplus_sources: String,
@@ -146,8 +150,8 @@ pub struct Config {
     /// 整份設定會解析失敗而退回預設值
     pub mini_rect: Option<[f64; 4]>,
     pub close_to_tray: bool,
-    /// 外觀：auto（跟隨 Windows 的應用程式模式）／dark／light。預設 dark ——
-    /// 淺色可以用，但數值是推測的、還在實驗中（設定視窗那列有標）
+    /// 外觀：auto（跟隨 Windows 的應用程式模式）／dark／light。預設 auto。
+    /// 舊設定檔裡已經存了 dark 的照舊是深色
     pub appearance: String,
     /// 強調色跟著現在播的封面變；關掉就固定 Spotify 綠
     pub accent_follow: bool,
@@ -171,6 +175,10 @@ pub struct Config {
     /// 文字PV_v2 的背景幾何圖形（實驗中，v2 開著才有作用、設定視窗也才出現）：很淡的圓、方、三角、叉
     /// 跟著低音到高音起伏。Rust 版才有
     pub lyrics_pv_geo: bool,
+    /// 文字PV_v2 的歌詞唱到哪個字才出現哪個字（實驗中）：關掉是整句先淡淡地擺著，唱到的字才亮。Rust 版才有
+    pub lyrics_pv_word: bool,
+    /// 上次看過更新內容的版本（scene_notes）：比現在的版本舊、而且這版有更新內容，啟動時彈一次。空字串 = 沒記錄過
+    pub notes_seen: String,
     /// 主視窗的畫面更新率上限（0 = 跟隨螢幕）。實際取螢幕更新率能整除、不超過它的值，
     /// 幀才會平均落在垂直同步上。視覺效果頁照 `viz_fps`。Rust 版才有
     pub fps_limit: u32,
@@ -205,6 +213,7 @@ impl Default for Config {
             lyrics_netease: true,
             lyrics_autoalign: false,
             lyrics_verify: false,
+            lyrics_wordfill: false,
             lyricsplus_sources: "qq,musixmatch,spotify".into(),
             viz_fps: 60,
             viz_category: "all".into(),
@@ -222,7 +231,7 @@ impl Default for Config {
             mini_lyrics: false,
             mini_rect: None,
             close_to_tray: false,
-            appearance: "dark".into(),
+            appearance: "auto".into(),
             accent_follow: true,
             font_cjk: String::new(),
             font_latin: String::new(),
@@ -231,6 +240,8 @@ impl Default for Config {
             lyrics_pv: false,
             lyrics_pv_v2: false,
             lyrics_pv_geo: false,
+            lyrics_pv_word: false,
+            notes_seen: String::new(),
             fps_limit: 0,
             taskbar_progress: false,
             taskbar_title: false,

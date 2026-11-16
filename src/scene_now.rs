@@ -104,6 +104,8 @@ pub struct PvIn<'a> {
     pub spec: [f32; crate::pv::idle::SPEC],
     /// 設定的「背景幾何圖形」與它跟的五個頻段（`audio::Spectrum::bands`，[`crate::pv::geo`]）
     pub geo: bool,
+    /// 設定的「唱到才出現的字」（v2）：還沒唱到的字不先擺出來
+    pub word: bool,
     pub bands: [f32; 5],
     /// 這一幀演出層畫完先存起來：v2 下一幀要換一份歌詞了（[`crate::pv::Pv::freeze`]）
     pub freeze: bool,
@@ -337,6 +339,7 @@ pub fn render_with(
             trans: now.show_trans,
             spec: p.spec,
             geo: p.geo,
+            word: p.word,
             bands: p.bands,
         });
         // v2 換一份歌詞：換之前那一幀存起來，換之後疊在演出上面淡掉（左欄與磨砂不在裡面）

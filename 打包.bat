@@ -15,6 +15,9 @@ set "RUSTFLAGS=--remap-path-prefix=%USERPROFILE%=~ --remap-path-prefix=%ROOT%=."
 rem aws-lc-sys 的 C 程式碼用 __FILE__，RUSTFLAGS 管不到，另外叫 MSVC 把使用者資料夾修掉。
 set "CFLAGS=/d1trimfile:%USERPROFILE%\"
 set "CARGO_TARGET_DIR=%ROOT%\target\dist"
+rem 更新內容：編譯時會把 RELEASE_NOTES_v<版本>.md 的條列嵌進 exe，換新版第一次啟動時彈一次。沒有那份檔案就不會彈。
+for /f "tokens=3 delims= " %%v in ('findstr /b /c:"version = " Cargo.toml') do if not defined VER set "VER=%%~v"
+if not exist "RELEASE_NOTES_v%VER%.md" echo WARNING: RELEASE_NOTES_v%VER%.md not found, no release notes will be embedded
 cargo build --release || exit /b 1
 if not exist dist mkdir dist
 copy /y target\dist\release\vitro.exe dist\VitroDeck.exe >nul || exit /b 1

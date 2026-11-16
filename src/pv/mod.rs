@@ -63,6 +63,8 @@ const WIPE_SOFT: f32 = 0.6;
 /// 演出層最底下先把歌詞頁的背景再壓暗多少。放在演出層裡（不是歌詞頁那邊另外蓋），
 /// 進出的時候才會跟著遮罩一起漫過來
 const DIM: f32 = 0.42;
+/// v2 畫面中間那團封面色光的透明度
+const V2_GLOW: f32 = 0.09;
 /// 進出一般歌詞頁：遮罩邊界前後的漸變各多寬（畫面寬的幾倍）、字一開始放大多少
 const MIX_SOFT: f32 = 0.3;
 const MIX_ZOOM: f32 = 0.07;
@@ -266,6 +268,8 @@ pub struct Input<'a> {
     pub spec: [f32; idle::SPEC],
     /// 設定的「背景幾何圖形」（v2 才有，[`geo`]）與它跟的五個頻段（`audio::Spectrum::bands`）
     pub geo: bool,
+    /// 設定的「唱到才出現的字」（v2 才有）：還沒唱到的字不先淡淡地擺出來（[`v2::WAIT`] 變 0）
+    pub word: bool,
     pub bands: [f32; 5],
 }
 
@@ -595,6 +599,9 @@ impl Pv {
             if inp.geo {
                 self.geo.draw(&mut back, seed, &inp.bands, inp.now, ms, &st, w, h);
             }
+            // 畫面中間一團極淡的封面色光（夜色底只偏一點，這個讓底看得出是封面的顏色）
+            let r = h * 0.75;
+            back.push(Inst::disk(w * 0.5, h * 0.5, r, with_a(accent, V2_GLOW), (0.0, 0.0)).blur(r * 0.6).fixed());
         } else {
             backdrop(&mut back, &self.plan.segs, si, ms, w, h);
         }
@@ -690,7 +697,7 @@ impl Pv {
             draw_decos(&mut deco, &mut self.atlas, gpu, text, line, ms, in_p, out_p, la, &beat, w, h, k);
 
             for (order, p) in line.lay.glyphs.iter().enumerate() {
-                let Some(st) = state(p, &line.lay, ms, exit_t, order, &beat, h, ls, line.pace, inp.v2) else { continue };
+                let Some(st) = state(p, &line.lay, ms, exit_t, order, &beat, h, ls, line.pace, inp.v2, if inp.word { 0.0 } else { v2::WAIT }) else { continue };
                 let gi = &line.g[p.i];
                 let Some(gk) = gi.key else { continue };
                 let Some(e) = self.atlas.get(gpu, gk, |kk| text.raster(kk)) else { continue };
@@ -735,6 +742,11 @@ impl Pv {
                     let c = ls.key_ink.unwrap_or(la);
                     if hot > 0.003 {
                         halo(&mut deco, st.x, st.y, p.size * st.scale, c, hot * st.alpha);
+                    }
+                    // 唱過的字退到背景時，字後面墊一層帶封面色的柔光，字本身看起來蒙蒙的
+                    let past = 1.0 - curf;
+                    if past > 0.003 {
+                        halo(&mut deco, st.x, st.y, p.size * st.scale, mix(ls.ink, c, 0.5), v2::PAST_HAZE * past * st.alpha);
                     }
                     mix(ls.ink, c, hot)
                 } else {
@@ -1206,7 +1218,7 @@ fn erase_at(n: usize, order: usize, exit_t: i64) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn state(p: &Placed, lay: &Layout, ms: i64, exit_t: i64, order: usize, beat: &Beat, h: f32, st: &Style, pace: f32, v2: bool) -> Option<State> {
+fn state(p: &Placed, lay: &Layout, ms: i64, exit_t: i64, order: usize, beat: &Beat, h: f32, st: &Style, pace: f32, v2: bool, wait: f32) -> Option<State> {
     let start = p.t - LEAD;
     if ms < start && !v2 {
         return None;
@@ -1214,7 +1226,7 @@ fn state(p: &Placed, lay: &Layout, ms: i64, exit_t: i64, order: usize, beat: &Be
     let dur = if v2 { (enter_ms(p.enter) * pace).clamp(260.0, 560.0) } else { enter_ms(p.enter) * pace };
     let te = (ms - start) as f32;
     let q = (te / dur).clamp(0.0, 1.0);
-    let (mut dx, mut dy, mut scale, mut rot, skew, mut alpha) = if v2 { light_up(p, q) } else { enter_at(p, q) };
+    let (mut dx, mut dy, mut scale, mut rot, skew, mut alpha) = if v2 { light_up(p, q, wait) } else { enter_at(p, q) };
     // 進場從失焦對焦：蓋章那種放大砸下來的收得快一點；閃現的不糊（那是故障風格的一閃一閃）。
     // v2 等著的字微微失焦，亮起來時對焦
     let mut blur = p.size
@@ -1346,7 +1358,7 @@ fn halo(out: &mut Vec<Inst>, x: f32, y: f32, size: f32, col: [f32; 4], a: f32) {
 
 /// v2 的進場：字早就淡淡地在原位等著，唱到時亮起來、往上浮一點再落回去；關鍵字多放大一點。
 /// 原本的進場（從 0 彈出來、從旁邊滑進來）跟「先淡淡地擺著」接不起來，所以不用
-fn light_up(p: &Placed, q: f32) -> (f32, f32, f32, f32, f32, f32) {
+fn light_up(p: &Placed, q: f32, wait: f32) -> (f32, f32, f32, f32, f32, f32) {
     let bump = (q * PI).sin();
     let amp = if !p.key {
         0.04
@@ -1357,7 +1369,7 @@ fn light_up(p: &Placed, q: f32) -> (f32, f32, f32, f32, f32, f32) {
             _ => 0.1,
         }
     };
-    (0.0, -bump * p.size * 0.06, 1.0 + amp * bump, 0.0, 0.0, v2::WAIT + (1.0 - v2::WAIT) * ease_out(q))
+    (0.0, -bump * p.size * 0.06, 1.0 + amp * bump, 0.0, 0.0, wait + (1.0 - wait) * ease_out(q))
 }
 
 /// (填色, 描邊色, 描邊寬, 填色倍率)

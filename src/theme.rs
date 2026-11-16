@@ -20,8 +20,8 @@ pub enum Mode {
 /// 使用者在設定裡選的外觀。`Auto` 跟隨 Windows 的「應用程式模式」。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Appearance {
-    Auto,
     #[default]
+    Auto,
     Dark,
     Light,
 }
@@ -30,8 +30,9 @@ impl Appearance {
     pub fn parse(s: &str) -> Self {
         match s {
             "auto" => Appearance::Auto,
+            "dark" => Appearance::Dark,
             "light" => Appearance::Light,
-            _ => Appearance::Dark,
+            _ => Appearance::Auto,
         }
     }
     pub fn key(self) -> &'static str {
@@ -1059,7 +1060,7 @@ mod tests {
         for a in [Appearance::Auto, Appearance::Dark, Appearance::Light] {
             assert_eq!(Appearance::parse(a.key()), a);
         }
-        assert_eq!(Appearance::parse("亂寫"), Appearance::Dark);
+        assert_eq!(Appearance::parse("亂寫"), Appearance::Auto);
         assert_eq!(Appearance::Dark.next(1), Appearance::Light);
         assert_eq!(Appearance::Dark.next(-1), Appearance::Auto);
     }

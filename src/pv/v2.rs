@@ -25,8 +25,10 @@ pub const SCENES: [Scene; 13] = super::scene::SCENES;
 pub const WAIT: f32 = 0.4;
 pub const PAST: f32 = 0.26;
 /// 唱過那句退到背景時多糊（邏輯 px）
-pub const PAST_BLUR: f32 = 1.8;
+pub const PAST_BLUR: f32 = 5.0;
 pub const LATER: f32 = 0.55;
+/// 唱過的字後面那層柔光的濃度（乘上 [`PAST`] 退暗後的透明度，所以數字比看起來大）
+pub const PAST_HAZE: f32 = 4.0;
 /// 唱到的字最慢多久亮到強調色、唱完多久褪回字色（毫秒）
 pub const RISE: f32 = 400.0;
 pub const COOL: f32 = 800.0;
@@ -50,6 +52,18 @@ pub fn night(hue: f32, chroma: f32) -> (f32, f32) {
     };
     let k = 0.3 + 0.7 * smooth01((tint::gap(h, hue) - 20.0) / 30.0);
     (h, 1.0 - (1.0 - k) * smooth01((chroma - 0.02) / 0.05))
+}
+
+/// 夜色底往封面色相靠多少度（最多）
+pub const LEAN: f32 = 60.0;
+
+/// 夜色底（色相 `night`）朝封面強調色（色相 `hue`）偏一點，讓底看得出跟封面有關係。
+/// 只往同一邊靠、最多 [`LEAN`] 度，不會越過強調色；兩者幾乎在對面（差 130 度以上）時方向不定、也怕偏進
+/// 橘黃那段變咖啡色，靠的量一路收到 0。灰階的封面（彩度 < 0.02）色相是亂的，不靠
+pub fn lean(night: f32, hue: f32, chroma: f32) -> f32 {
+    let d = (hue - night + 180.0).rem_euclid(360.0) - 180.0;
+    let fade = smooth01((170.0 - d.abs()) / 40.0) * smooth01((chroma - 0.02) / 0.04);
+    night + d.signum() * d.abs().min(LEAN) * fade
 }
 
 /// 這個場景要先淡淡地擺出後面幾句。
@@ -144,6 +158,32 @@ mod tests {
         assert!((0.29..0.4).contains(&k), "{k}");
         // 灰階的封面色相是亂的，不收
         assert!(night(264.0, 0.005).1 > 0.99);
+    }
+
+    #[test]
+    fn 底往封面色靠但不越過也不進咖啡色() {
+        // 紅（26 度）：夜色挑 245，往 26 的方向（經 360）靠 30～60 度
+        let (n, _) = night(26.0, 0.15);
+        let m = lean(n, 26.0, 0.15) - n;
+        assert!((30.0..=LEAN).contains(&m), "{m}");
+        // 綠（147 度）：夜色挑 290，往 147 的方向（往小的）靠 30～60 度
+        let (n, _) = night(147.0, 0.15);
+        let m = n - lean(n, 147.0, 0.15);
+        assert!((30.0..=LEAN).contains(&m), "{m}");
+        // 離得近就靠到頂（不越過）
+        assert!((lean(260.0, 280.0, 0.15) - 280.0).abs() < 0.1);
+        // 金、橘在對面：不靠
+        let (n, _) = night(80.0, 0.15);
+        assert!((lean(n, 80.0, 0.15) - n).abs() < 0.1);
+        // 灰階的封面不靠
+        assert!((lean(260.0, 26.0, 0.005) - 260.0).abs() < 0.1);
+        // 不論強調色在哪，底都不會靠進 20～120 度的橘黃棕
+        for i in 0..360 {
+            let hue = i as f32;
+            let (n, _) = night(hue, 0.15);
+            let h = lean(n, hue, 0.15).rem_euclid(360.0);
+            assert!(!(20.0..=120.0).contains(&h), "{hue} → {h}");
+        }
     }
 
     #[test]

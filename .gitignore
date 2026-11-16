@@ -23,6 +23,10 @@ cache/
 /design_tokens.md
 /glass_ref.html
 /RELEASE_NOTES_*.md
+/AUDIT_REPORT.md
+
+# 介紹網站原始碼（不放這個 repo）
+/site-new/
 
 # 歌詞對齊的離線實驗與收資料啟動檔
 /tools/align/

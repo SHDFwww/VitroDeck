@@ -52,6 +52,10 @@ pub struct Lyrics {
     /// 自動對齊量出來的單曲偏移（`align.json`）。手動的 `offset_ms` 不是 0 時不用
     #[serde(skip)]
     pub auto_ms: i64,
+    /// 逐字是之後聽寫補出來的（`align/fill.rs`），不是來源給的：準度約 0.1 秒，量偏移時要當逐句看。
+    /// 不存在歌詞快取裡
+    #[serde(skip)]
+    pub filled: bool,
     /// 產生這份快取的來源鏈版本。比現在的 `CHAIN_VERSION` 舊的，換到這首時會重抓一次
     /// （新加了來源，舊的行級結果值得試著升級），重抓過就不再問。
     pub chain: u8,
@@ -134,6 +138,11 @@ impl Lyrics {
     /// 有沒有逐字時間（只要有一句有就算）
     pub fn has_words(&self) -> bool {
         self.synced.iter().any(|l| l.words.as_ref().is_some_and(|w| !w.is_empty()))
+    }
+
+    /// 來源本來就給逐字（補出來的不算）
+    pub fn native_words(&self) -> bool {
+        self.has_words() && !self.filled
     }
 }
 
@@ -357,6 +366,7 @@ impl Fetcher {
             None => self.fetch_cached(cfg, key, artist, title, album, duration_ms, platform_id, &bad),
         };
         got.offset_ms = read_offsets(&self.dir).get(key).copied().unwrap_or(0);
+        crate::align::fill_words(&self.dir, key, &mut got);
         got.auto_ms = crate::align::auto_shift(&self.dir, key, &got);
         got
     }

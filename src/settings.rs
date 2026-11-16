@@ -69,10 +69,14 @@ pub enum Item {
     LyricsPvV2,
     /// v2 的背景幾何圖形（實驗中）。只在設定視窗，而且文字 PV 與 v2 都開著才出現
     LyricsPvGeo,
+    /// v2 的歌詞唱到哪個字才出現哪個字（實驗中）。跟背景幾何圖形一樣，文字 PV 與 v2 都開著才出現
+    LyricsPvWord,
     /// 播放時聽歌聲自動校正歌詞時間、抓配錯歌的歌詞（`align/`）。只在設定視窗
     LyricsAutoalign,
     /// 聽寫歌聲、比對歌詞的字來判斷配錯（`align/verify.rs`）。只在設定視窗，而且自動對齊開著才出現
     LyricsVerify,
+    /// 只有逐句的歌詞，聽寫歌聲補出逐字時間（`align/fill.rs`）。只在設定視窗，而且自動對齊開著才出現
+    LyricsWordFill,
     /// 主視窗的畫面更新率上限。只在設定視窗
     FpsLimit,
     /// 工作列按鈕上的播放進度。只在設定視窗
@@ -185,8 +189,10 @@ impl Item {
             Item::LyricsPv => "文字 PV",
             Item::LyricsPvV2 => "文字PV_v2",
             Item::LyricsPvGeo => "背景幾何圖形",
+            Item::LyricsPvWord => "唱到才出現的字",
             Item::LyricsAutoalign => "自動對齊歌詞",
             Item::LyricsVerify => "比對歌詞內容",
+            Item::LyricsWordFill => "逐句歌詞補成逐字",
             Item::FpsLimit => "畫面更新率上限",
             Item::TaskbarProgress => "工作列顯示播放進度",
             Item::TaskbarTitle => "工作列顯示歌手與歌名",
@@ -205,6 +211,7 @@ impl Item {
             Item::SpotifyStatus => "還沒有 client_id 的話，按一下開設定精靈",
             Item::LyricsAutoalign => "首次使用需下載約 36MB 模型",
             Item::LyricsVerify => "首次使用需下載約 500MB 模型",
+            Item::LyricsWordFill => "第一次播完後在背景算，下次播才有逐字；模型與比對歌詞內容共用",
             _ => "",
         }
     }
@@ -212,8 +219,7 @@ impl Item {
     /// 標籤右邊的小徽章。只有還在試的功能才有
     pub fn badge(self) -> &'static str {
         match self {
-            Item::Appearance => "淺色實驗中",
-            Item::LyricsPv | Item::LyricsPvV2 | Item::LyricsPvGeo | Item::LyricsVerify => "實驗中",
+            Item::LyricsPv | Item::LyricsPvV2 | Item::LyricsPvGeo | Item::LyricsPvWord | Item::LyricsVerify | Item::LyricsWordFill => "實驗中",
             _ => "",
         }
     }
@@ -244,8 +250,10 @@ impl Item {
             Item::LyricsPv => on_off(cfg.lyrics_pv),
             Item::LyricsPvV2 => on_off(cfg.lyrics_pv_v2),
             Item::LyricsPvGeo => on_off(cfg.lyrics_pv_geo),
+            Item::LyricsPvWord => on_off(cfg.lyrics_pv_word),
             Item::LyricsAutoalign => on_off(cfg.lyrics_autoalign),
             Item::LyricsVerify => on_off(cfg.lyrics_verify),
+            Item::LyricsWordFill => on_off(cfg.lyrics_wordfill),
             Item::Vinyl => on_off(cfg.vinyl),
             Item::VinylRpm => rpm_label(cfg.vinyl_rpm),
             Item::MiniEnabled => on_off(cfg.mini_enabled),
@@ -336,8 +344,10 @@ impl Item {
             Item::LyricsPv => cfg.lyrics_pv = !cfg.lyrics_pv,
             Item::LyricsPvV2 => cfg.lyrics_pv_v2 = !cfg.lyrics_pv_v2,
             Item::LyricsPvGeo => cfg.lyrics_pv_geo = !cfg.lyrics_pv_geo,
+            Item::LyricsPvWord => cfg.lyrics_pv_word = !cfg.lyrics_pv_word,
             Item::LyricsAutoalign => cfg.lyrics_autoalign = !cfg.lyrics_autoalign,
             Item::LyricsVerify => cfg.lyrics_verify = !cfg.lyrics_verify,
+            Item::LyricsWordFill => cfg.lyrics_wordfill = !cfg.lyrics_wordfill,
             Item::Vinyl => cfg.vinyl = !cfg.vinyl,
             Item::VinylRpm => {
                 // 不在刻度上的（Python 版滑桿拉出來的 7 rpm 之類）從最近的那格開始
@@ -430,8 +440,10 @@ impl Item {
             Item::LyricsPv => cfg.lyrics_pv,
             Item::LyricsPvV2 => cfg.lyrics_pv_v2,
             Item::LyricsPvGeo => cfg.lyrics_pv_geo,
+            Item::LyricsPvWord => cfg.lyrics_pv_word,
             Item::LyricsAutoalign => cfg.lyrics_autoalign,
             Item::LyricsVerify => cfg.lyrics_verify,
+            Item::LyricsWordFill => cfg.lyrics_wordfill,
             Item::Vinyl => cfg.vinyl,
             Item::MiniEnabled => cfg.mini_enabled,
             Item::MiniLocked => cfg.mini_locked,
@@ -548,8 +560,8 @@ impl Item {
     pub fn hidden(self, cfg: &Config) -> bool {
         match self {
             Item::LyricsPvV2 => !cfg.lyrics_pv,
-            Item::LyricsPvGeo => !(cfg.lyrics_pv && cfg.lyrics_pv_v2),
-            Item::LyricsVerify => !cfg.lyrics_autoalign,
+            Item::LyricsPvGeo | Item::LyricsPvWord => !(cfg.lyrics_pv && cfg.lyrics_pv_v2),
+            Item::LyricsVerify | Item::LyricsWordFill => !cfg.lyrics_autoalign,
             _ => false,
         }
     }
@@ -646,7 +658,7 @@ impl Page {
                 ("顏色", &[I::Appearance, I::AccentFollow]),
                 ("進階", &[I::FpsLimit]),
             ],
-            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsAutoalign, I::LyricsVerify, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv, I::LyricsPvV2, I::LyricsPvGeo])],
+            Page::Lyrics => &[("", &[I::LyricsOffset, I::LyricsAutoalign, I::LyricsVerify, I::LyricsWordFill, I::LyricsTraditional, I::Ktv]), ("", &[I::LyricsPv, I::LyricsPvV2, I::LyricsPvGeo, I::LyricsPvWord])],
             Page::Vinyl => &[("", &[I::Vinyl, I::VinylRpm])],
             Page::Mini => &[("", &[I::MiniEnabled, I::MiniLocked, I::MiniLyrics, I::MiniRecall])],
             Page::Viz => &[("", &[I::VizEnabled]), ("MilkDrop", &[I::VizFps, I::VizCategory, I::VizShaders])],
@@ -689,7 +701,7 @@ mod tests {
         for it in ITEMS {
             assert_eq!(all.iter().filter(|x| *x == it).count(), 1, "{it:?}");
         }
-        assert_eq!(all.len(), ITEMS.len() + 16, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV 三列、自動對齊、比對歌詞、更新率上限、工作列的進度、曲名與 Discord");
+        assert_eq!(all.len(), ITEMS.len() + 18, "多出來的只有外觀、強調色、叫回迷你視窗、兩個字型、字型大小、介面大小、文字 PV 四列、自動對齊、比對歌詞、逐句補逐字、更新率上限、工作列的進度、曲名與 Discord");
     }
 
     #[test]

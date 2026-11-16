@@ -39,6 +39,7 @@ mod prefs;
 mod pv;
 mod quad;
 mod scene_about;
+mod scene_notes;
 mod scene_flow;
 mod scene_help;
 mod scene_now;
@@ -687,6 +688,8 @@ struct App {
     /// 關於面板（I）。`about_confirm`：中斷連結按過一次，等第二次
     about_open: bool,
     about_confirm: bool,
+    /// 更新內容彈窗：換了新版第一次啟動時開，關掉才記「看過了」（[`scene_notes`]）
+    notes_open: bool,
     /// 裝置選單（D）。跟設定面板一樣是疊層，清單本身在 `Shared::devices`。
     devices_open: bool,
     devices_sel: usize,
@@ -1994,12 +1997,17 @@ impl App {
         match p.event(ev, &self.cfg, screens) {
             Some(prefs::Action::Close) => self.prefs = None,
             // 要下載 500 MB：第一次打開先問。下載過的不問，模型刪掉才會再問
-            Some(prefs::Action::Edit(settings::Item::LyricsVerify, _))
-                if !self.cfg.lyrics_verify && !crate::align::engine_ready(&self.paths) =>
+            Some(prefs::Action::Edit(it @ (settings::Item::LyricsVerify | settings::Item::LyricsWordFill), _))
+                if !it.is_on(&self.cfg) && !crate::align::engine_ready(&self.paths) =>
             {
-                p.ask_verify();
+                p.ask_verify(it);
             }
-            Some(prefs::Action::VerifyYes) => self.set_item(settings::Item::LyricsVerify, settings::Edit::Press),
+            Some(prefs::Action::VerifyYes(it)) => self.set_item(it, settings::Edit::Press),
+            // 更新內容彈窗開在主視窗上：先把主視窗叫到前面。已經看過的版本也能再叫出來
+            Some(prefs::Action::Notes) => {
+                self.bring_front(el);
+                self.notes_open = true;
+            }
             // 裝置選單、關於、設定精靈是主視窗上的面板：先把主視窗叫到前面，不然開在看不到的地方
             Some(prefs::Action::Edit(it, e))
                 if matches!(it, settings::Item::Device | settings::Item::About)
@@ -2304,6 +2312,19 @@ impl App {
         self.devices_open = false;
     }
 
+    /// 記下這個版本的更新內容看過了
+    fn see_notes(&mut self) {
+        if self.cfg.notes_seen != config::VERSION {
+            self.cfg.notes_seen = config::VERSION.to_string();
+            self.save_cfg();
+        }
+    }
+
+    fn close_notes(&mut self) {
+        self.notes_open = false;
+        self.see_notes();
+    }
+
     fn close_about(&mut self) {
         self.about_open = false;
         self.about_confirm = false;
@@ -2444,6 +2465,13 @@ impl App {
     }
 
     fn on_key(&mut self, el: &ActiveEventLoop, key: &Key) {
+        // 更新內容：除了單按修飾鍵，按什麼都關掉（那個鍵不再往下傳，不會誤觸別的功能）
+        if self.notes_open {
+            if !matches!(key, Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super)) {
+                self.close_notes();
+            }
+            return;
+        }
         if self.setup.is_some() {
             self.on_key_setup(key);
             return;
@@ -2699,6 +2727,9 @@ impl App {
         if self.about_open {
             panels.push(ui::about(fw, fh).panel);
         }
+        if self.notes_open {
+            panels.push(scene_notes::layout(fw, fh).panel);
+        }
         if self.help_open {
             panels.push(scene_help::panel_rect(fw, fh));
         }
@@ -2716,6 +2747,9 @@ impl App {
         let r = self.r.as_ref()?;
         let (fw, fh) = gfx::logical(r.target.width, r.target.height);
         let (mx, my) = self.cursor;
+        if self.notes_open {
+            return scene_notes::hit(&scene_notes::layout(fw, fh), mx, my);
+        }
         if let Some(p) = &self.picker {
             return ui::hit_picker(&ui::picker(fw, fh), p.top, p.rows.len(), mx, my);
         }
@@ -2830,6 +2864,7 @@ impl App {
             }
             Hit::CloseDevices => self.devices_open = false,
             Hit::CloseAbout => self.close_about(),
+            Hit::CloseNotes => self.close_notes(),
             Hit::AboutGuide => {
                 if let Err(e) = oauth::open_in_browser(config::GUIDE_URL) {
                     self.toast(format!("開不了瀏覽器：{e}"));
@@ -3006,6 +3041,7 @@ impl App {
             settings::Item::LyricsTraditional => zh::set_enabled(self.cfg.lyrics_traditional),
             settings::Item::LyricsAutoalign => self.sync_autoalign(),
             settings::Item::LyricsVerify => crate::align::set_verify(self.cfg.lyrics_verify),
+            settings::Item::LyricsWordFill => crate::align::set_wordfill(self.cfg.lyrics_wordfill),
             // 拖曳中先不套：設定視窗會跟著縮放，滑桿就在游標底下跑掉。放開時（`DragEnd`）才套
             settings::Item::UiScale
                 if self.prefs.as_ref().and_then(|p| p.dragging()) != Some(settings::Item::UiScale) =>
@@ -3668,7 +3704,7 @@ impl App {
                 // 滑鼠停在哪句：每幀重算，因為歌詞自己會捲，滑鼠不動底下的句子也會換
                 // （疊層開著就不算；`r` 借走了 self.r，這裡只能直接讀欄位）
                 let covered = self.picker.is_some() || self.settings_open || self.help_open
-                    || self.about_open || self.devices_open || self.setup.is_some();
+                    || self.about_open || self.devices_open || self.setup.is_some() || self.notes_open;
                 let over = (self.cursor_in && !covered)
                     .then(|| self.lyric_hits.at(self.cursor.0, self.cursor.1))
                     .flatten();
@@ -3742,6 +3778,7 @@ impl App {
                         pulse: self.spec.lock().map(|s| s.pulse).unwrap_or_default(),
                         spec: self.spec.lock().map(|s| pv::idle::spec_from(&s.level)).unwrap_or_default(),
                         geo: self.cfg.lyrics_pv_geo,
+                        word: self.cfg.lyrics_pv_word,
                         bands: self.spec.lock().map(|s| s.bands).unwrap_or_default(),
                         title: &s.title,
                         artist: &s.artist,
@@ -3878,6 +3915,11 @@ impl App {
                 self.about_confirm,
             ) {
                 crate::warn!("關於畫不出來：{e}");
+            }
+        }
+        if self.notes_open {
+            if let Err(e) = scene_notes::render(&r.gpu, &r.target, &mut r.quads, &mut r.glass, &mut r.text, self.hover) {
+                crate::warn!("更新內容畫不出來：{e}");
             }
         }
         if self.help_open {
@@ -4313,7 +4355,7 @@ impl ApplicationHandler<UserEv> for App {
                 }
                 // 覆蓋層開著時滾輪不能穿過去捲底下的封面流（Python 版 v1.0.4 修過同一個）。
                 // 設定面板例外：停在某一列上就是調那一列，跟左右鍵一樣
-                if self.settings_open || self.help_open || self.about_open || self.devices_open || self.setup.is_some() {
+                if self.settings_open || self.help_open || self.about_open || self.devices_open || self.setup.is_some() || self.notes_open {
                     if let (true, Some(ui::Hit::SettingRow(i))) = (self.settings_open, self.hover) {
                         self.change_setting(i, if d > 0.0 { 1 } else { -1 });
                     }
@@ -4791,6 +4833,7 @@ fn main() -> anyhow::Result<()> {
         help_open: false,
         about_open: false,
         about_confirm: false,
+        notes_open: false,
         toast: None,
         setup: need_setup.then(scene_setup::Setup::default),
         mods: Default::default(),
@@ -4814,6 +4857,13 @@ fn main() -> anyhow::Result<()> {
     // 走 poller 那條：畫面開始跑才取走、才開始計時，視窗還沒出來就不會先過期
     if config::CONFIG_BAD.load(std::sync::atomic::Ordering::Relaxed) {
         app.player.shared.toast("設定檔讀不進來，已改用預設值；原檔在 config.json.bad");
+    }
+    // 換了新版第一次啟動：彈這一版的更新內容。第一次安裝（正在跑設定精靈）沒有「更新了什麼」可講，
+    // 直接記成看過，之後升級才會彈
+    if need_setup {
+        app.see_notes();
+    } else if scene_notes::due(&app.cfg.notes_seen) {
+        app.notes_open = true;
     }
     // 啟動時問一次 GitHub（Python 版的 update_check）。沒新版不出聲
     if app.cfg.update_check {

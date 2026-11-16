@@ -159,6 +159,8 @@ pub enum Hit {
     AboutLicenses,
     AboutDisconnect,
     CloseAbout,
+    /// 更新內容彈窗（[`crate::scene_notes`]）
+    CloseNotes,
 }
 
 /// 愛心、裝置、音量那一組要的狀態。封面流的控制列與歌詞頁共用。

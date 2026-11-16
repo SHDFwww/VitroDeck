@@ -103,7 +103,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             use crate::settings::{PAGES, Page};
             let page = match rest.trim_start_matches(':') {
                 "account" => Page::Account,
-                "lyrics" | "verify" => Page::Lyrics,
+                "lyrics" | "verify" | "fill" => Page::Lyrics,
                 "vinyl" => Page::Vinyl,
                 "mini" => Page::Mini,
                 "viz" => Page::Viz,
@@ -126,7 +126,11 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
                 page: PAGES.iter().position(|p| *p == page).unwrap_or(0),
                 fonts,
                 fonts_reveal: fonts.is_some(),
-                verify_ask: rest.trim_start_matches(':') == "verify",
+                verify_ask: match rest.trim_start_matches(':') {
+                    "verify" => Some(crate::settings::Item::LyricsVerify),
+                    "fill" => Some(crate::settings::Item::LyricsWordFill),
+                    _ => None,
+                },
                 hot: std::env::var("VITRO_PREFS_HOVER").ok().and_then(|v| v.parse().ok()).map(crate::prefs::Hit::FontRow),
                 ..Default::default()
             };
@@ -205,6 +209,20 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
             )?;
             target.save_png(&gpu, path)?;
             println!("寫出 {} 場景=關於", path.display());
+            return Ok(());
+        }
+
+        // `notes`：換新版第一次啟動彈的更新內容（用編進這個 exe 的那份）
+        if scene == "notes" {
+            let mut covers = crate::cover::CoverRenderer::new(&gpu, OFFSCREEN_FORMAT);
+            let albums = crate::scene_flow::fake_albums(&gpu, 12);
+            crate::scene_flow::render(
+                &gpu, &target, &mut quads, &mut covers, &mut glass, &mut text, &albums, 4.0, &bar_under(&albums, crate::scene_notes::layout(lw, lh).panel, lw, lh), 1.0, &veil,
+                None,
+            )?;
+            crate::scene_notes::render(&gpu, &target, &mut quads, &mut glass, &mut text, fake_hover())?;
+            target.save_png(&gpu, path)?;
+            println!("寫出 {} 場景=更新內容", path.display());
             return Ok(());
         }
 

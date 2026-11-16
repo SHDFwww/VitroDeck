@@ -145,6 +145,7 @@ pub fn run(path: &Path, width: u32, height: u32, scene: &str) -> anyhow::Result<
                 duration: dur,
                 spec: fake_spec(sms),
                 geo: std::env::var_os("VITRO_PV_GEO").is_some(),
+                word: std::env::var_os("VITRO_PV_WORD").is_some(),
                 bands: fake_bands(sms),
                 freeze,
             }),
